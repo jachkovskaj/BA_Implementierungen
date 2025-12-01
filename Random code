@@ -1,0 +1,2249 @@
+##################################################
+import numpy as np, pandas as pd
+from sklearn.preprocessing import RobustScaler
+from numpy.linalg import norm
+import os
+
+# Dateien laden
+df_taguchi = pd.read_excel('Daten/Taguchi_Einleger_Fliessfronten.xlsx').assign(Versuchsplan="Taguchi")
+df_lhs     = pd.read_excel('Daten/LHS_Einleger_Fliessfronten.xlsx').assign(Versuchsplan="LHS")
+df_sobol   = pd.read_excel('Daten/Sobol_Einleger_Fliessfronten.xlsx').assign(Versuchsplan="Sobol")
+df_halton  = pd.read_excel('Daten/Halton_Einleger_Fliessfronten.xlsx').assign(Versuchsplan="Halton")
+
+OUT_DIR  = r"Getrennte_Daten"
+N_TEST   = 391           # ~10% des Gesamtdatensets
+PLAN_COL = "Versuchsplan"
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# Alle Pläne zusammenführen
+df_all = pd.concat([df_taguchi, df_lhs, df_sobol, df_halton], ignore_index=True)
+
+# Ein- und Ausgabespalten für Modell 1
+feat_cols = df_all.columns[:10]
+output_cols = df_all.columns[-3:]
+
+# Ein- und Ausgabespalten für Modell 2
+# feat_cols = df_all.columns[:3]
+# output_cols = df_all.columns[-1:]
+
+# ---------- Duplikate erkennen ----------
+df_all["__key__"] = df_all[feat_cols].round(12).astype(str).agg("|".join, axis=1)
+grp = df_all.groupby("__key__").transform("size")
+df_all["__dup"] = grp > 1
+df_all = df_all.loc[~df_all["__dup"] | ~df_all.duplicated("__key__")].reset_index(drop=True)
+
+# ---------- DUPLEX ----------
+def build_duplex_holdout(df, n_test=N_TEST, plan_col=PLAN_COL, random_state=0):
+    rng = np.random.default_rng(random_state)
+    X = df[feat_cols].values  # nur Eingaben
+    Xs = RobustScaler().fit_transform(X)
+
+    plans, counts = np.unique(df[plan_col].values, return_counts=True)
+    targets = {p: max(1, int(round(n_test * c/len(df)))) for p, c in zip(plans, counts)}
+
+    eligible = ~df["__dup"].fillna(False)
+    idx_all = np.where(eligible)[0]
+    if len(idx_all) < n_test:
+        raise ValueError("Zu wenige konfliktfreie Punkte für gewünschte Holdout-Größe.")
+
+    start = idx_all[np.argmax(norm(Xs[idx_all], axis=1))]
+    holdout = [start]
+    taken = np.zeros(len(df), dtype=bool); taken[start] = True
+
+    def can_take(i):
+        pid = df.loc[i, plan_col]
+        drawn = sum(df.loc[j, plan_col]==pid for j in holdout)
+        return drawn < targets[pid]
+
+    while len(holdout) < n_test:
+        H = Xs[holdout]
+        dmin = np.min(np.linalg.norm(Xs[:, None, :] - H[None, :, :], axis=2), axis=1)
+        order = np.argsort(-dmin)
+        chosen = None
+        for i in order:
+            if taken[i] or not eligible[i]: continue
+            if can_take(i): chosen = i; break
+        if chosen is None:
+            for i in order:
+                if not taken[i] and eligible[i]: chosen = i; break
+        holdout.append(chosen); taken[chosen] = True
+
+    return np.array(holdout, dtype=int)
+
+# Holdout erzeugen
+idx_holdout = build_duplex_holdout(df_all, n_test=N_TEST, plan_col=PLAN_COL, random_state=42)
+df_holdout  = df_all.iloc[idx_holdout].copy()
+df_pool_all = df_all.drop(df_all.index[idx_holdout]).copy()
+
+# Speichern (Outputs bleiben enthalten)
+df_holdout.drop(columns=["__key__","__dup"]).to_excel(os.path.join(OUT_DIR, "Holdout_fixed_Modell_1.xlsx"), index=False)
+df_holdout[feat_cols].to_excel(os.path.join(OUT_DIR, "Holdout__Modell_1_Input.xlsx"), index=False)
+df_holdout[output_cols].to_excel(os.path.join(OUT_DIR, "Holdout_Modell_1_Output.xlsx"), index=False)
+
+for plan_id, dfp in df_pool_all.groupby(PLAN_COL):
+    dfp.drop(columns=["__key__","__dup"]).to_excel(os.path.join(OUT_DIR, f"Pool_{plan_id}_Modell_1.xlsx"), index=False)
+    dfp[feat_cols].to_excel(os.path.join(OUT_DIR, f"Pool_{plan_id}_Modell_1_Input.xlsx"), index=False)
+    dfp[output_cols].to_excel(os.path.join(OUT_DIR, f"Pool_{plan_id}_Modell_1_Output.xlsx"), index=False)
+
+print("Holdout_fixed_Modell_1.xlsx + Pool_<plan>_Moddell_1.xlsx sind gespeichert.")
+
+######################################################
+
+import numpy as np, pandas as pd
+from sklearn.preprocessing import RobustScaler
+from numpy.linalg import norm
+import os
+
+# Dateien laden
+df_taguchi = pd.read_excel('Daten/Taguchi_Fliessfronten_Auslenkung.xlsx').assign(Versuchsplan="Taguchi")
+df_lhs     = pd.read_excel('Daten/LHS_Fliessfronten_Auslenkung.xlsx').assign(Versuchsplan="LHS")
+df_sobol   = pd.read_excel('Daten/Sobol_Fliessfronten_Auslenkung.xlsx').assign(Versuchsplan="Sobol")
+df_halton  = pd.read_excel('Daten/Halton_Fliessfronten_Auslenkung.xlsx').assign(Versuchsplan="Halton")
+
+OUT_DIR  = r"Getrennte_Daten"
+N_TEST   = 391           # ~10% des Gesamtdatensets
+PLAN_COL = "Versuchsplan"
+Y_COL    = "Auslenkung"
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# Alle Pläne zusammenführen
+df_all = pd.concat([df_taguchi, df_lhs, df_sobol, df_halton], ignore_index=True)
+feat_cols = [c for c in df_all.columns if c not in [PLAN_COL, Y_COL]]
+output_cols = [Y_COL]
+
+# ---------- Duplikate effizient erkennen ----------
+# Hash-Key aus X-Spalten
+df_all["__key__"] = df_all[feat_cols].round(12).astype(str).agg("|".join, axis=1)
+
+# Prüfen, ob gleiche X unterschiedliche y haben
+grp = df_all.groupby("__key__")[Y_COL].transform("nunique")
+df_all["__dup_y_conflict__"] = grp > 1
+
+# Bei konfliktfreien Keys nur einen Eintrag behalten
+df_all = df_all.loc[~df_all["__dup_y_conflict__"] | ~df_all.duplicated("__key__")].reset_index(drop=True)
+
+# ---------- DUPLEX (farthest-point) für Holdout ----------
+def build_duplex_holdout(df, n_test=N_TEST, plan_col=PLAN_COL, y_col=Y_COL, random_state=0):
+    rng = np.random.default_rng(random_state)
+    X = df[feat_cols].values
+    Xs = RobustScaler().fit_transform(X)
+
+    # plan-proportionale Zielmengen
+    plans, counts = np.unique(df[plan_col].values, return_counts=True)
+    targets = {p: max(1, int(round(n_test * c/len(df)))) for p, c in zip(plans, counts)}
+
+    eligible = ~df["__dup_y_conflict__"].fillna(False)
+    idx_all = np.where(eligible)[0]
+    if len(idx_all) < n_test:
+        raise ValueError("Zu wenige konfliktfreie Punkte für gewünschte Holdout-Größe.")
+
+    # Start = Punkt mit größter Norm
+    start = idx_all[np.argmax(norm(Xs[idx_all], axis=1))]
+    holdout = [start]
+    taken = np.zeros(len(df), dtype=bool); taken[start] = True
+
+    def can_take(i):
+        pid = df.loc[i, plan_col]
+        drawn = sum(df.loc[j, plan_col]==pid for j in holdout)
+        return drawn < targets[pid]
+
+    while len(holdout) < n_test:
+        H = Xs[holdout]
+        dmin = np.min(np.linalg.norm(Xs[:, None, :] - H[None, :, :], axis=2), axis=1)
+        order = np.argsort(-dmin)
+        chosen = None
+        for i in order:
+            if taken[i] or not eligible[i]: continue
+            if can_take(i): chosen = i; break
+        if chosen is None:
+            for i in order:
+                if not taken[i] and eligible[i]: chosen = i; break
+        holdout.append(chosen); taken[chosen] = True
+
+    return np.array(holdout, dtype=int)
+
+# Holdout erzeugen
+idx_holdout = build_duplex_holdout(df_all, n_test=N_TEST, plan_col=PLAN_COL, random_state=42)
+df_holdout  = df_all.iloc[idx_holdout].copy()
+df_pool_all = df_all.drop(df_all.index[idx_holdout]).copy()
+
+# Speichern
+df_holdout.drop(columns=["__key__","__dup_y_conflict__"]).to_excel(os.path.join(OUT_DIR, "Holdout_fixed_Modell_2.xlsx"), index=False)
+for plan_id, dfp in df_pool_all.groupby(PLAN_COL):
+    dfp = dfp.drop(columns=["__key__","__dup_y_conflict__"])
+    dfp.to_excel(os.path.join(OUT_DIR, f"Pool_{plan_id}_Modell_2.xlsx"), index=False)
+
+print("Holdout_fixed_Modell_2.xlsx+ pool_<plan>.xlsx sind gespeichert.")
+
+####################################################
+
+import os
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+import scipy.stats as stats
+
+# Datei und Sheets definieren
+excel_path = "Daten/Taguchi_Einleger_Fliessfronten.xlsx"
+sheet_names = ['Tabelle1']
+
+# Ordner für Plots und Texte
+plot_ordner = "Plots_Distribution"
+os.makedirs(plot_ordner, exist_ok=True)
+
+# Funktion zur Analyse und Plot-Erzeugung
+def analysiere_blatt(df, sheet_name):
+    data = df.iloc[:, -1]
+
+    mean = np.mean(data)
+    std = np.std(data)
+    skew = stats.skew(data)
+    kurt = stats.kurtosis(data)
+
+    shapiro_stat, shapiro_p = stats.shapiro(data)
+    anderson_result = stats.anderson(data, dist='norm')
+    ks_stat, ks_p = stats.kstest(data, 'norm', args=(mean, std))
+
+    einschaetzung = "Die Daten sind "
+    if shapiro_p > 0.05 and anderson_result.statistic < anderson_result.critical_values[2] and ks_p > 0.05:
+        einschaetzung += "vereinbar mit einer Normalverteilung."
+    else:
+        einschaetzung += "nicht normalverteilt."
+
+    stat_summary = f"""Verteilungsanalyse – Blatt: {sheet_name}
+Mittelwert: {mean:.3f}
+Standardabweichung: {std:.3f}
+Schiefe: {skew:.3f}
+Kurtosis: {kurt:.3f}
+Shapiro-Wilk-Test: Statistik={shapiro_stat:.3f}, p={shapiro_p:.3f}
+Anderson-Darling-Test: Statistik={anderson_result.statistic:.3f}, kritischer Wert (5%): {anderson_result.critical_values[2]:.3f}
+Kolmogorov-Smirnov-Test: Statistik={ks_stat:.3f}, p={ks_p:.3f}
+Interpretation: {einschaetzung}
+"""
+
+    # Text abspeichern
+    summary_file = os.path.join(plot_ordner, f"Verteilungsanalyse_Taguchi_Modell_1_{sheet_name}.txt")
+    with open(summary_file, "w", encoding="utf-8") as f:
+        f.write(stat_summary)
+
+    # Histogramm
+    plt.figure(figsize=(8, 5))
+    plt.hist(data, bins=30, density=True, alpha=0.7, color="skyblue", edgecolor="black")
+
+    # Dichtekurve berechnen
+    kde = stats.gaussian_kde(data)
+    x_vals = np.linspace(min(data), max(data), 500)
+    plt.plot(x_vals, kde(x_vals), color="black", linewidth=2, label="KDE")
+
+    plt.title(f"Histogramm der Daten – {sheet_name}")
+    plt.xlabel("Wert")
+    plt.ylabel("Dichte")
+    plt.tight_layout()
+    plt.savefig(os.path.join(plot_ordner, f"Histogramm_Taguchi_Modell_1_{sheet_name}.png"))
+    plt.close()
+
+    # QQ-Plot
+    plt.figure(figsize=(6, 6))
+    stats.probplot(data, dist="norm", plot=plt)
+    plt.title(f"Q-Q-Plot – {sheet_name}")
+    plt.tight_layout()
+    plt.savefig(os.path.join(plot_ordner, f"QQ-Plot_Taguchi_Modell_1_{sheet_name}.png"))
+    plt.close()
+
+    print(f"{sheet_name}: Analyse abgeschlossen.\n{stat_summary}\n")
+
+# Excel-Datei öffnen
+xlsx = pd.ExcelFile(excel_path)
+
+# Schleife über alle Blätter
+for name in sheet_names:
+    df_sheet = pd.read_excel(xlsx, sheet_name=name)
+    analysiere_blatt(df_sheet, name)
+
+########################################################
+
+import atexit
+import glob
+import math
+import os
+import signal
+import logging
+
+import keras
+import matplotlib.lines as mlines
+import matplotlib.pyplot as plt
+import numpy as np
+import optuna
+import pandas as pd
+import tensorflow as tf
+
+from kennard_stone import train_test_split  # KS-Split
+from optuna_integration import TFKerasPruningCallback
+from packaging import version
+from sklearn.metrics import root_mean_squared_error, r2_score
+
+# ========= LOGGING =========
+optuna.logging.set_verbosity(optuna.logging.INFO)
+optuna.logging.enable_default_handler()
+logger = logging.getLogger("optuna")
+logger.setLevel(logging.INFO)
+
+# ========= HPO STATE =========
+# ========= HPO STATE =========
+class Optimization:
+    def __init__(self, study_name, seed, patience, epochs, n_trials, pool_file, holdout_file):
+        self.epochs = epochs
+        self.n_trials = n_trials
+        self.patience = patience
+        self.seed = seed
+        self.study_name = study_name
+        self.pool_file = pool_file
+        self.holdout_file = holdout_file
+        self.model_file = ""
+        # Normalisierung
+        self.data_min_x = None
+        self.data_max_x = None
+        self.data_min_y = None
+        self.data_max_y = None
+        # Outputpfade
+        self.paths = {}
+
+
+hpoptimize: Optimization = None
+current_model = None
+current_study = None
+
+
+# ========= INIT =========
+def initialize(study_name, seed, patience, epochs, n_trials):
+    global hpoptimize
+    hpoptimize = Optimization(study_name, seed, patience, epochs, n_trials, None, None)
+
+    if version.parse(tf.__version__) < version.parse("2.11.0"):
+        raise RuntimeError("tensorflow>=2.11.0 is required")
+
+    base_dir = os.path.join("Ergebnisse", study_name)
+    os.makedirs(base_dir, exist_ok=True)
+    sqlite_path = os.path.join(base_dir, f"{study_name}.sqlite3")
+    if os.path.isfile(sqlite_path):
+        print(f"Study file already exists: {sqlite_path}")
+
+    hpoptimize.model_file = os.path.join(base_dir, "checkpoint.model.keras")
+
+# ========= SIGNAL-HANDLER =========
+def save_model_and_study_on_interrupt(signum, frame):
+    global current_model, current_study
+    if current_model:
+        print("\nProgram interrupted. Saving the current model...")
+        current_model.save("interrupted_model.keras")
+        print("Model saved as 'interrupted_model.keras'.")
+    if current_study:
+        save_study_results()
+    print("Exiting program.")
+    exit(0)
+
+signal.signal(signal.SIGINT, save_model_and_study_on_interrupt)
+
+# ========= STYLES =========
+def parse_mplstyle(style_file_path):
+    with open(style_file_path, 'r') as file:
+        style_settings = {}
+        for line in file:
+            if line.strip() and not line.strip().startswith('#'):
+                key, value = line.strip().split(':', 1)
+                style_settings[key.strip()] = value.strip()
+    return style_settings
+
+# ========= PLOTTING =========
+def plot_graphs(history, trial_number, y_train, train_predict, y_val, val_predict, y_test, test_predict):
+    plt.rcdefaults
+    try:
+        plt.style.use(["IKV.mplstyle"])
+    except Exception:
+        pass
+
+    # RMSE History
+    fig, ax = plt.subplots()
+    plt.plot(history.history["val_root_mean_squared_error"], label="Validationsdaten")
+    plt.plot(history.history["root_mean_squared_error"], label="Trainingsdaten")
+    ax.set_ylim(bottom=0)
+    ax.set_xlim(left=0)
+    ax.set_ylabel("RMSE [mm]")
+    ax.set_xlabel("Epoche  [-]")
+    ax.legend(loc="upper right")
+    plt.tight_layout()
+    plt.savefig(os.path.join(hpoptimize.paths["plots"], f"{trial_number}_RMSE.png"))
+    plt.close()
+
+    # Huber Loss History
+    fig, ax = plt.subplots()
+    plt.plot(history.history["val_loss"], label="Validationsdaten")
+    plt.plot(history.history["loss"], label="Trainingsdaten")
+    ax.set_ylim(bottom=0)
+    ax.set_xlim(left=0)
+    ax.set_ylabel("Huber [-]")
+    ax.set_xlabel("Epoche  [-]")
+    ax.legend(loc='upper right')
+    plt.tight_layout()
+    plt.savefig(os.path.join(hpoptimize.paths["plots"], f"{trial_number}_Huber_Loss.png"))
+    plt.close()
+
+    # Predict vs True
+    plt.scatter(y_train, train_predict, label="Trainingsdaten")
+    plt.scatter(y_test, test_predict, label="Testdaten")
+    plt.scatter(y_val, val_predict, label="Validationsdaten")
+    ax = plt.gca()
+    ax.legend(loc='upper left')
+    plt.xlabel('Reale Fließfronten [mm]', fontsize=15)
+    ax.set_xlim([0, 100])
+    ax.set_xticks(np.arange(0, 100, step=10))
+    plt.ylabel('Vorhergesagte Fließfronten [mm]', fontsize=15)
+    ax.set_ylim([0, 100])
+    ax.set_yticks(np.arange(0, 100, step=10))
+    line = mlines.Line2D([0, 1], [0, 1], color="black", alpha=0.8)
+    transform = ax.transAxes
+    line.set_transform(transform)
+    ax.add_line(line)
+    plt.tight_layout()
+    plt.savefig(os.path.join(hpoptimize.paths["plots"], f"{trial_number}_Predict_vs._True.png"))
+    plt.close()
+
+def apply_custom_chart_style(chart_all_data, y_train, y_val, y_test, train_predict, val_predict, test_predict, combined_df, worksheet_all_data):
+    max_value = max(
+        y_train.max(), y_val.max(), y_test.max(),
+        train_predict.max(), val_predict.max(), test_predict.max())
+    max_value_rounded = math.ceil(max_value)
+
+    chart_all_data.set_title({
+        "name": "True vs Predicted Values",
+        "name_font": {"size": 14, "bold": True, "color": "black"}
+    })
+    chart_all_data.set_x_axis({
+        "name": "True Values [mm]",
+        "name_font": {"size": 12, "bold": False, "color": "black"},
+        "num_font": {"size": 10, "color": "black"},
+        "line": {"color": "black", "width": 1.0},
+        "major_gridlines": {"visible": True, "line": {"color": "black", "width": 0.5}},
+        "min": 0,
+        "max": max_value_rounded
+    })
+    chart_all_data.set_y_axis({
+        "name": "Predicted Values [mm]",
+        "name_font": {"size": 12, "bold": False, "color": "black"},
+        "num_font": {"size": 10, "color": "black"},
+        "line": {"color": "black", "width": 1.0},
+        "major_gridlines": {"visible": True, "line": {"color": "black", "width": 0.5}},
+        "min": 0,
+        "max": max_value_rounded
+    })
+    chart_all_data.set_plotarea({
+        "border": {"color": "black", "width": 0.5},
+        "fill": {"color": "white"}
+    })
+    chart_all_data.set_chartarea({
+        "border": {"color": "black", "width": 0.5},
+        "fill": {"color": "white"}
+    })
+
+def save_trial_results_with_dynamic_style(trial_number, y_train, train_predict, y_test, test_predict, y_val, val_predict, history):
+    output_file = os.path.join(hpoptimize.paths["metrics"], f"Trial_{trial_number}.xlsx")
+
+    with pd.ExcelWriter(output_file, engine="xlsxwriter") as writer:
+        train_df = pd.DataFrame({
+            "True Values Train": np.array(y_train).flatten(),
+            "Predictions Train": np.array(train_predict).flatten()
+        })
+        valid_df = pd.DataFrame({
+            "True Values Validation": np.array(y_val).flatten(),
+            "Predictions Validation": np.array(val_predict).flatten()
+        })
+        test_df = pd.DataFrame({
+            "True Values Test": np.array(y_test).flatten(),
+            "Predictions Test": np.array(test_predict).flatten()
+        })
+
+        combined_df = pd.concat([train_df, valid_df, test_df], axis=1)
+        combined_df.to_excel(writer, sheet_name="All_Data", index=False, header=True)
+
+        history_df = pd.DataFrame({
+            "Epoch": range(1, len(history.history["loss"]) + 1),
+            "Train RMSE": history.history["root_mean_squared_error"],
+            "Validation RMSE": history.history["val_root_mean_squared_error"],
+            "Train Loss": history.history["loss"],
+            "Validation Loss": history.history["val_loss"]
+        })
+        history_df.to_excel(writer, sheet_name="Metrics", index=False)
+
+        workbook = writer.book
+        worksheet_all_data = writer.sheets["All_Data"]
+        chart_all_data = workbook.add_chart({"type": "scatter"})
+
+        for dataset, color, columns in zip(
+                ["Train", "Validation", "Test"],
+                ["#95BB20", "#717E86", "#00354E"],
+                [("True Values Train", "Predictions Train"),
+                 ("True Values Validation", "Predictions Validation"),
+                 ("True Values Test", "Predictions Test")]
+        ):
+            start_row = 1
+            end_row = len(combined_df)
+            chart_all_data.add_series({
+                "name": f"{dataset} Data",
+                "categories": ["All_Data", start_row, combined_df.columns.get_loc(columns[0]), end_row,
+                               combined_df.columns.get_loc(columns[0])],
+                "values": ["All_Data", start_row, combined_df.columns.get_loc(columns[1]), end_row,
+                           combined_df.columns.get_loc(columns[1])],
+                "marker": {"type": "circle", "size": 6, "fill": {"color": color}, "border": {"none": True}}
+            })
+
+        max_value = math.ceil(max(
+            y_train.max(), y_val.max(), y_test.max(),
+            train_predict.max(), val_predict.max(), test_predict.max()))
+
+        # 45°-Linie
+        worksheet_all_data.write_row(len(combined_df) + 1, 0, [0, 0])
+        worksheet_all_data.write_row(len(combined_df) + 2, 0, [max_value, max_value])
+        chart_all_data.add_series({
+            "name": None,
+            "categories": ["All_Data", len(combined_df) + 1, 0, len(combined_df) + 2, 0],
+            "values":     ["All_Data", len(combined_df) + 1, 1, len(combined_df) + 2, 1],
+            "line": {"color": "black", "dash_type": "dash", "width": 1.0},
+            "marker": {"type": "none"},
+        })
+
+        # Vertikale Linie x=max
+        worksheet_all_data.write_row(len(combined_df) + 3, 0, [max_value, 0])
+        worksheet_all_data.write_row(len(combined_df) + 4, 0, [max_value, max_value])
+        chart_all_data.add_series({
+            "categories": ["All_Data", len(combined_df) + 3, 0, len(combined_df) + 4, 0],
+            "values":     ["All_Data", len(combined_df) + 3, 1, len(combined_df) + 4, 1],
+            "line": {"color": "black", "width": 1.0},
+            "marker": {"type": "none"},
+            "name": None
+        })
+
+        # Horizontale Linie y=max
+        worksheet_all_data.write_row(len(combined_df) + 5, 0, [0, max_value])
+        worksheet_all_data.write_row(len(combined_df) + 6, 0, [max_value, max_value])
+        chart_all_data.add_series({
+            "categories": ["All_Data", len(combined_df) + 5, 0, len(combined_df) + 6, 0],
+            "values":     ["All_Data", len(combined_df) + 5, 1, len(combined_df) + 6, 1],
+            "line": {"color": "black", "width": 1.0},
+            "marker": {"type": "none"},
+            "name": None
+        })
+
+        apply_custom_chart_style(chart_all_data, y_train, y_val, y_test,
+                                 train_predict, val_predict, test_predict,
+                                 combined_df, worksheet_all_data)
+        worksheet_all_data.insert_chart("I2", chart_all_data)
+
+# ========= DATA HANDLING =========
+def load_pool_and_holdout(pool_input_file, pool_output_file, holdout_input_file, holdout_output_file, output_col):
+    x_pool = pd.read_excel(pool_input_file)
+    y_pool_all = pd.read_excel(pool_output_file)
+
+    x_test = pd.read_excel(holdout_input_file)
+    y_test_all = pd.read_excel(holdout_output_file)
+
+    if isinstance(output_col, int):
+        y_pool = y_pool_all.iloc[:, output_col]
+        y_test = y_test_all.iloc[:, output_col]
+    else:
+        y_pool = y_pool_all.loc[:, output_col]
+        y_test = y_test_all.loc[:, output_col]
+
+    return x_pool, y_pool, x_test, y_test
+
+
+def ks_train_val_split(x_pool, y_pool, val_size=0.111111):
+    y_pool = np.array(y_pool).reshape(-1, 1)
+    x_train, x_val, y_train, y_val = train_test_split(x_pool, y_pool, test_size=val_size)
+    return x_train, x_val, y_train.ravel(), y_val.ravel()
+
+def load_and_normalize_for_hpo(x_pool, y_pool, x_test, y_test, val_size=0.111111):
+    # KS auf Pool (→ Train/Val)
+    x_train, x_val, y_train, y_val = ks_train_val_split(x_pool, y_pool, val_size=val_size)
+    y_train, y_val, y_test = map(lambda y: np.array(y).flatten(), (y_train, y_val, y_test))
+
+    """ # sicherstellen, dass y 1D ist
+        y_train = np.array(y_train).flatten()
+        y_val   = np.array(y_val).flatten()
+        y_test  = np.array(y_test).flatten()"""
+
+    # Min/Max nur auf Train
+    hpoptimize.data_min_x = np.min(x_train, axis=0).astype(np.float32)
+    hpoptimize.data_max_x = np.max(x_train, axis=0).astype(np.float32)
+    hpoptimize.data_min_y = float(np.min(y_train))
+    hpoptimize.data_max_y = float(np.max(y_train))
+    eps = 1e-12
+
+    def nx(dfX):
+        return (dfX - hpoptimize.data_min_x) / (hpoptimize.data_max_x - hpoptimize.data_min_x + eps)
+    def ny(srY):
+        return (srY - hpoptimize.data_min_y) / (hpoptimize.data_max_y - hpoptimize.data_min_y + eps)
+
+    return nx(x_train), ny(y_train), nx(x_val), ny(y_val), nx(x_test), ny(y_test)
+
+# ========= (DE-)NORMALISIERUNG =========
+def unnormalize_x(x_norm):
+    return x_norm * (hpoptimize.data_max_x - hpoptimize.data_min_x) + hpoptimize.data_min_x
+
+def unnormalize_y(y_norm):
+    return y_norm * (hpoptimize.data_max_y - hpoptimize.data_min_y) + hpoptimize.data_min_y
+
+# ========= SPLIT DUMP =========
+def save_split_data(x_train, y_train, x_val, y_val, x_test, y_test):
+    """
+    Speichert die (ggf. normalisierten) Train/Val/Test-Splits als Excel
+    (jeweils letzter Spalteneintrag = y).
+    """
+    output_folder = f"Ergebnisse/{hpoptimize.study_name}"
+    os.makedirs(output_folder, exist_ok=True)
+    file_path = os.path.join(hpoptimize.paths["data"], f"Split_Daten_{hpoptimize.study_name}.xlsx")
+
+    y_train = np.array(y_train).flatten()
+    y_val = np.array(y_val).flatten()
+    y_test = np.array(y_test).flatten()
+
+    with pd.ExcelWriter(file_path, engine="xlsxwriter") as writer:
+        train_df = pd.concat([x_train.reset_index(drop=True),
+                              pd.Series(y_train).reset_index(drop=True).rename('target')], axis=1)
+        train_df.to_excel(writer, sheet_name="Train", index=False)
+
+        val_df = pd.concat([x_val.reset_index(drop=True),
+                            pd.Series(y_val).reset_index(drop=True).rename('target')], axis=1)
+        val_df.to_excel(writer, sheet_name="Validation", index=False)
+
+        test_df = pd.concat([x_test.reset_index(drop=True),
+                             pd.Series(y_test).reset_index(drop=True).rename('target')], axis=1)
+        test_df.to_excel(writer, sheet_name="Test", index=False)
+
+# ========= MODELL =========
+def create_model(trial):
+    n_layers = trial.suggest_int(name="n_Layers", low=1, high=3)
+    learning_rate = trial.suggest_float(name="Learning_Rate", low=0.0001, high=1, log=True)
+    weight_decay  = trial.suggest_float(name="Weight_Decay",  low=1e-10,  high=1e-3, log=True)
+
+    model = keras.Sequential()
+    model.add(keras.layers.Flatten())
+
+    for i in range(n_layers):
+        act_func  = trial.suggest_categorical(f"act_func_l{i}", ["tanh", "relu"])
+        num_units = trial.suggest_int(f"n_units_l{i}", 4, 128, log=True)
+        model.add(
+            keras.layers.Dense(
+                num_units,
+                activation=act_func,
+                kernel_regularizer=keras.regularizers.l2(weight_decay),
+            )
+        )
+
+    model.add(keras.layers.Dense(1, kernel_regularizer=tf.keras.regularizers.l2(weight_decay)))
+
+    model.compile(
+        loss=keras.losses.Huber(),
+        metrics=[keras.metrics.RootMeanSquaredError()],
+        optimizer=keras.optimizers.AdamW(learning_rate=learning_rate, weight_decay=weight_decay),
+    )
+    return model
+
+# ========= OBJECTIVE =========
+def objective(trial):
+    global current_model, x_pool, y_pool, x_test, y_test
+
+    # Reproduzierbarkeit
+    os.environ['PYTHONHASHSEED'] = str(hpoptimize.seed)
+    np.random.seed(hpoptimize.seed)
+    tf.random.set_seed(hpoptimize.seed)
+    tf.keras.utils.set_random_seed(hpoptimize.seed)
+    tf.config.experimental.enable_op_determinism()
+
+    # Nur Train/Val splitten (KS), fixes Holdout laden
+    x_train, y_train, x_val, y_val, x_test, y_test = load_and_normalize_for_hpo(
+        x_pool, y_pool, x_test, y_test, val_size=0.111111)
+
+    # Erstelle Modell
+    model = create_model(trial)
+    current_model = model  # Update the global model reference
+
+    # Parameter Callback
+    callback = [
+        keras.callbacks.EarlyStopping(
+            monitor='val_root_mean_squared_error',
+            patience=hpoptimize.patience,
+            mode="min"),
+        keras.callbacks.ModelCheckpoint(
+            hpoptimize.model_file,
+            monitor="val_root_mean_squared_error",
+            mode="min",
+            save_best_only=True,
+            verbose=0),
+        TFKerasPruningCallback(trial, 'val_root_mean_squared_error')
+    ]
+
+    batch_size = trial.suggest_int("Batch_Size", low=1, high=32, log=True)
+
+    # Fit
+    try:
+        history = model.fit(
+            x_train, y_train,
+            validation_data=(x_val, y_val),
+            batch_size=batch_size,
+            epochs=hpoptimize.epochs,
+            verbose=0,
+            shuffle=True,
+            callbacks=callback
+        )
+
+    except optuna.exceptions.TrialPruned:
+        print(f"Trial {trial.number} wurde gepruned.")
+        trial.set_user_attr("pruned", True)
+        raise
+
+    with tf.device('/CPU:0'):
+        _train_pred = model.predict(x_train, verbose=0).astype(np.float32).ravel()
+        _val_pred = model.predict(x_val, verbose=0).astype(np.float32).ravel()
+        _test_pred = model.predict(x_test, verbose=0).astype(np.float32).ravel()
+
+    if np.std(_val_pred) < 1e-6 or np.std(_test_pred) < 1e-6:
+        # Optional: als schlecht zurückgeben oder prunen
+        raise optuna.TrialPruned(f"Constant predictions (std<1e-6), pruning trial {trial.number}.")
+
+    # Bestes Modell laden
+    if os.path.exists(hpoptimize.model_file):
+        best_model = keras.models.load_model(hpoptimize.model_file)
+    else:
+        print("Warnung: Modelldatei nicht gefunden! Speichere das letzte Modell stattdessen.")
+        best_model = model
+        best_model.save(hpoptimize.model_file)
+
+    # Vorhersagen (unnormalisiert für RMSE/R2)
+    print("train: ")
+    train_predict = best_model.predict(x_train)
+    y_train_unn = unnormalize_y(y_train)
+    train_pred_unn = unnormalize_y(train_predict)
+    train_rmse = root_mean_squared_error(y_train_unn, train_pred_unn)
+    train_r2 = r2_score(y_train_unn, train_pred_unn)
+
+    print("val: ")
+    val_predict = best_model.predict(x_val)
+    y_val_unn = unnormalize_y(y_val)
+    val_pred_unn = unnormalize_y(val_predict)
+    val_rmse = root_mean_squared_error(y_val_unn, val_pred_unn)
+    val_r2 = r2_score(y_val_unn, val_pred_unn)
+
+    print("test: ")
+    test_predict = best_model.predict(x_test)
+    y_test_unn = unnormalize_y(y_test)
+    test_pred_unn = unnormalize_y(test_predict)
+    test_rmse = root_mean_squared_error(y_test_unn, test_pred_unn)
+    test_r2 = r2_score(y_test_unn, test_pred_unn)
+
+    # Excel/Plots
+    save_trial_results_with_dynamic_style(
+        trial.number, y_train_unn, train_pred_unn, y_test_unn, test_pred_unn, y_val_unn, val_pred_unn, history)
+
+    # Trial-Attrs
+    trial.set_user_attr("train_r2",  train_r2)
+    trial.set_user_attr("val_r2",    val_r2)
+    trial.set_user_attr("test_r2",   test_r2)
+    trial.set_user_attr("train_rmse", train_rmse)
+    trial.set_user_attr("val_rmse",   val_rmse)
+    trial.set_user_attr("test_rmse",  test_rmse)
+
+    # Modell speichern
+    model_path = os.path.join(hpoptimize.paths["models"], f"{hpoptimize.study_name}_{trial.number}.keras")
+    best_model.save(model_path)
+
+    # Plots
+    plot_graphs(history, trial.number,
+                y_train_unn, train_pred_unn,
+                y_val_unn,   val_pred_unn,
+                y_test_unn,  test_pred_unn)
+
+    # Metriken CSV
+    metrics_df = pd.DataFrame({
+        'Dataset': ['Train', 'Validation', 'Test'],
+        'RMSE': [train_rmse, val_rmse, test_rmse],
+        'R2': [train_r2, val_r2, test_r2]
+    })
+    metrics_df.to_csv(os.path.join(hpoptimize.paths["metrics"], f"metrics_{trial.number}.csv"), index=False)
+
+    if np.isnan(val_rmse):
+        print(f"Trial {trial.number}: val_rmse ist NaN!")
+
+    return val_rmse
+
+# ========= STUDY SAVE =========
+def save_study_results():
+    global current_study
+    if current_study:
+        print("\nSaving study results...")
+        study_name = hpoptimize.study_name
+        study_path = f"Ergebnisse/{study_name}"
+        os.makedirs(study_path, exist_ok=True)
+        study_file = f"{study_path}/{study_name}.xlsx"
+        current_study.trials_dataframe().to_excel(study_file)
+        print(f"Study results saved to: {study_file}")
+
+atexit.register(save_study_results)
+
+def save_model_and_study_on_interrupt(signum, frame):
+    global current_model, current_study
+    if current_model:
+        print("\nProgram interrupted. Saving the current model...")
+        current_model.save("interrupted_model.keras")
+        print("Model saved as 'interrupted_model.keras'.")
+    save_study_results()
+    print("Exiting program.")
+    exit(0)
+
+signal.signal(signal.SIGINT, save_model_and_study_on_interrupt)
+
+# ========= RUN HPO =========
+def run_hpo(study_name, seed, patience, epochs, n_trials, pool_input_file, pool_output_file, holdout_input_file, holdout_output_file, output_col, val_size=0.111111):
+    """
+    Führt die HPO-Pipeline aus:
+    - Initialisiert Pfade,
+    - erzeugt Train/Val (KS) aus 'pool_file', lädt fixes Holdout aus 'holdout_file',
+    - normalisiert (Fit auf Train), speichert Splits (normiert & unnormiert),
+    - führt Optuna-Optimierung aus,
+    - räumt Modelle/Plots auf.
+    """
+    global current_study, x_pool, y_pool, x_test, y_test
+    initialize(study_name, seed, patience, epochs, n_trials)
+
+    # Ergebnisstruktur
+    base_dir = f"Ergebnisse/{hpoptimize.study_name}"
+    hpoptimize.paths = {
+        "base": base_dir,
+        "models": os.path.join(base_dir, "models"),
+        "plots": os.path.join(base_dir, "plots"),
+        "metrics": os.path.join(base_dir, "metrics"),
+        "data": os.path.join(base_dir, "data")
+    }
+    for path in hpoptimize.paths.values():
+        os.makedirs(path, exist_ok=True)
+
+    # Einmalige Splits (Norm/Unnorm) speichern für Reproduzierbarkeit
+    # Pool + Holdout laden
+    x_pool, y_pool, x_test, y_test = load_pool_and_holdout(
+        pool_input_file, pool_output_file,
+        holdout_input_file, holdout_output_file,
+        output_col
+    )
+
+    # Normalisieren + KS-Split
+    x_train, y_train, x_val, y_val, x_test, y_test = load_and_normalize_for_hpo(
+        x_pool, y_pool, x_test, y_test, val_size=val_size)
+
+    # Splits speichern
+    save_split_data(x_train, y_train, x_val, y_val, x_test, y_test)  # normierte
+    save_split_data(
+        unnormalize_x(x_train), unnormalize_y(y_train),
+        unnormalize_x(x_val), unnormalize_y(y_val),
+        unnormalize_x(x_test), unnormalize_y(y_test)
+    )
+
+    sampler = optuna.samplers.TPESampler(seed=hpoptimize.seed, multivariate=True, n_startup_trials=50)
+    pruner = optuna.pruners.MedianPruner(n_startup_trials=200, n_warmup_steps=500, interval_steps=50)
+
+    study = optuna.create_study(
+        direction="minimize",
+        sampler=sampler,
+        pruner=pruner,
+        study_name=hpoptimize.study_name,
+        storage=f"sqlite:///{os.path.join(base_dir, hpoptimize.study_name + '.sqlite3')}",
+        load_if_exists=True
+    )
+
+    current_study = study
+    study.optimize(objective, n_trials=hpoptimize.n_trials)
+
+    save_study_results()
+
+    # Cleanup: nur Top-10 Modelle/Plots behalten
+    print("Deleting models except the best 10...")
+    top_10_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    top_10_trials = sorted(top_10_trials, key=lambda t: t.value)[:10]
+
+    if not top_10_trials:
+        print("Warnung: Keine erfolgreichen Trials gefunden. Es werden keine Modelle oder Plots gelöscht.")
+        return
+
+    top_10_model_files = {
+        os.path.join(hpoptimize.paths["models"], f"{hpoptimize.study_name}_{trial.number}.keras")
+        for trial in top_10_trials
+    }
+    top_10_plot_files = {
+        os.path.join(hpoptimize.paths["plots"], f"{trial.number}_RMSE.png") for trial in top_10_trials
+    } | {
+        os.path.join(hpoptimize.paths["plots"], f"{trial.number}_Huber_Loss.png") for trial in top_10_trials
+    } | {
+        os.path.join(hpoptimize.paths["plots"], f"{trial.number}_Predict_vs._True.png") for trial in top_10_trials
+    }
+
+    all_model_files = glob.glob(f"{hpoptimize.paths['models']}/*.keras")
+    all_plot_files  = glob.glob(f"{hpoptimize.paths['plots']}/*.png")
+
+    print("Top 10 Trials (nach val_rmse):")
+    for t in top_10_trials:
+        print(f"Trial {t.number}: value = {t.value}")
+
+    print("Alle gespeicherten Modell-Dateien:")
+    for file in all_model_files:
+        print(" -", file)
+
+    print("Top 10 erlaubte Modelle:")
+    for file in top_10_model_files:
+        print(" ✓", file)
+
+    deleted_models = 0
+    deleted_plots = 0
+
+    for model_file in all_model_files:
+        if model_file not in top_10_model_files and os.path.basename(model_file).startswith(hpoptimize.study_name):
+            try:
+                os.remove(model_file)
+                print(f"Modell gelöscht: {model_file}")
+                deleted_models += 1
+            except FileNotFoundError:
+                pass
+
+    for plot_file in all_plot_files:
+        if plot_file not in top_10_plot_files:
+            try:
+                os.remove(plot_file)
+                print(f"Plot gelöscht: {plot_file}")
+                deleted_plots += 1
+            except FileNotFoundError:
+                pass
+
+    print(f"Cleanup abgeschlossen: {deleted_models} Modelle und {deleted_plots} Plots wurden gelöscht.")
+
+# ========= MAIN =========
+if __name__ == '__main__':
+    # 4 Pläne iterieren – alle nutzen dasselbe fixe Holdout
+    holdout_input_file = r"Getrennte_Daten/Holdout_Modell_1_Input.xlsx"
+    holdout_output_file = r"Getrennte_Daten/Holdout_Modell_1_Output.xlsx"
+
+    study = "Study_17_09_2025_Taguchi_Modell_1.3_KS_Holdout_seed_999"
+
+    pool_input_file = r"Getrennte_Daten/Pool_Taguchi_Modell_1_Input.xlsx"
+    pool_output_file = r"Getrennte_Daten/Pool_Taguchi_Modell_1_Output.xlsx"
+
+    run_hpo(
+        study_name=study,
+        seed=999,
+        patience=100,
+        n_trials=500,
+        epochs=1000,
+        pool_input_file=pool_input_file,
+        pool_output_file=pool_output_file,
+        holdout_input_file=holdout_input_file,
+        holdout_output_file=holdout_output_file,
+        output_col="Knoten_3",
+        val_size=0.111111,
+    )
+
+#####################################################
+
+def load_and_normalize_for_hpo(x_pool, y_pool, x_test, y_test, val_size=0.111111):
+    # KS auf Pool (→ Train/Val)
+    x_train, x_val, y_train, y_val = ks_train_val_split(x_pool, y_pool, val_size=val_size)
+    y_train, y_val, y_test = map(lambda y: np.array(y).flatten(), (y_train, y_val, y_test))
+
+    """ # sicherstellen, dass y 1D ist
+        y_train = np.array(y_train).flatten()
+        y_val   = np.array(y_val).flatten()
+        y_test  = np.array(y_test).flatten()"""
+
+    # Min/Max nur auf Train
+    hpoptimize.train_min_x = np.min(x_train, axis=0).astype(np.float32)
+    hpoptimize.train_max_x = np.max(x_train, axis=0).astype(np.float32)
+    hpoptimize.val_min_x = np.min(x_val, axis=0).astype(np.float32)
+    hpoptimize.val_max_x = np.max(x_val, axis=0).astype(np.float32)
+    hpoptimize.test_min_x = np.min(x_test, axis=0).astype(np.float32)
+    hpoptimize.test_max_x = np.max(x_test, axis=0).astype(np.float32)
+    hpoptimize.train_min_y = float(np.min(y_train))
+    hpoptimize.train_max_y = float(np.max(y_train))
+    hpoptimize.val_min_y = float(np.min(y_val))
+    hpoptimize.val_max_y = float(np.max(y_val))
+    hpoptimize.test_min_y = float(np.min(y_test))
+    hpoptimize.test_max_y = float(np.max(y_test))
+    eps = 1e-12
+
+    def ntrx(dfX):
+        return (dfX - hpoptimize.train_min_x) / (hpoptimize.train_max_x - hpoptimize.train_min_x + eps)
+    def ntry(srY):
+        return (srY - hpoptimize.train_min_y) / (hpoptimize.train_max_y - hpoptimize.train_min_y + eps)
+    def nvx(dfX):
+        return (dfX - hpoptimize.val_min_x) / (hpoptimize.val_max_x - hpoptimize.val_min_x + eps)
+    def nvy(srY):
+        return (srY - hpoptimize.val_min_y) / (hpoptimize.val_max_y - hpoptimize.val_min_y + eps)
+    def ntx(dfX):
+        return (dfX - hpoptimize.test_min_x) / (hpoptimize.test_max_x - hpoptimize.test_min_x + eps)
+    def nty(srY):
+        return (srY - hpoptimize.test_min_y) / (hpoptimize.test_max_y - hpoptimize.test_min_y + eps)
+
+    return ntrx(x_train), ntry(y_train), nvx(x_val), nvy(y_val), ntx(x_test), nty(y_test)
+
+############################################################
+
+import atexit
+import glob
+import math
+import os
+import signal
+import logging
+
+import keras
+import matplotlib.lines as mlines
+import matplotlib.pyplot as plt
+import numpy as np
+import optuna
+import pandas as pd
+import tensorflow as tf
+
+from kennard_stone import train_test_split  # KS-Split
+from optuna_integration import TFKerasPruningCallback
+from packaging import version
+from sklearn.metrics import root_mean_squared_error, r2_score
+
+# ========= LOGGING =========
+optuna.logging.set_verbosity(optuna.logging.INFO)
+optuna.logging.enable_default_handler()
+logger = logging.getLogger("optuna")
+logger.setLevel(logging.INFO)
+
+# ========= HPO STATE =========
+# ========= HPO STATE =========
+class Optimization:
+    def __init__(self, study_name, seed, patience, epochs, n_trials, pool_file, holdout_file):
+        self.epochs = epochs
+        self.n_trials = n_trials
+        self.patience = patience
+        self.seed = seed
+        self.study_name = study_name
+        self.pool_file = pool_file
+        self.holdout_file = holdout_file
+        self.model_file = ""
+        self.paths = {}
+
+# ========= INIT =========
+def initialize(study_name, seed, patience, epochs, n_trials):
+    global hpoptimize
+    hpoptimize = Optimization(study_name, seed, patience, epochs, n_trials, None, None)
+
+    if version.parse(tf.__version__) < version.parse("2.11.0"):
+        raise RuntimeError("tensorflow>=2.11.0 is required")
+
+    base_dir = os.path.join("Ergebnisse", study_name)
+    os.makedirs(base_dir, exist_ok=True)
+    sqlite_path = os.path.join(base_dir, f"{study_name}.sqlite3")
+    if os.path.isfile(sqlite_path):
+        print(f"Study file already exists: {sqlite_path}")
+
+    hpoptimize.model_file = os.path.join(base_dir, "checkpoint.model.keras")
+
+# ========= SIGNAL-HANDLER =========
+def save_model_and_study_on_interrupt(signum, frame):
+    global current_model, current_study
+    if current_model:
+        print("\nProgram interrupted. Saving the current model...")
+        current_model.save("interrupted_model.keras")
+        print("Model saved as 'interrupted_model.keras'.")
+    if current_study:
+        save_study_results()
+    print("Exiting program.")
+    exit(0)
+
+signal.signal(signal.SIGINT, save_model_and_study_on_interrupt)
+
+# ========= STYLES =========
+def parse_mplstyle(style_file_path):
+    with open(style_file_path, 'r') as file:
+        style_settings = {}
+        for line in file:
+            if line.strip() and not line.strip().startswith('#'):
+                key, value = line.strip().split(':', 1)
+                style_settings[key.strip()] = value.strip()
+    return style_settings
+
+# ========= PLOTTING =========
+def plot_graphs(history, trial_number, y_train, train_predict, y_val, val_predict, y_test, test_predict):
+    plt.rcdefaults
+    try:
+        plt.style.use(["IKV.mplstyle"])
+    except Exception:
+        pass
+
+    # RMSE History
+    fig, ax = plt.subplots()
+    plt.plot(history.history["val_root_mean_squared_error"], label="Validationsdaten")
+    plt.plot(history.history["root_mean_squared_error"], label="Trainingsdaten")
+    ax.set_ylim(bottom=0)
+    ax.set_xlim(left=0)
+    ax.set_ylabel("RMSE [mm]")
+    ax.set_xlabel("Epoche  [-]")
+    ax.legend(loc="upper right")
+    plt.tight_layout()
+    plt.savefig(os.path.join(hpoptimize.paths["plots"], f"{trial_number}_RMSE.png"))
+    plt.close()
+
+    # Huber Loss History
+    fig, ax = plt.subplots()
+    plt.plot(history.history["val_loss"], label="Validationsdaten")
+    plt.plot(history.history["loss"], label="Trainingsdaten")
+    ax.set_ylim(bottom=0)
+    ax.set_xlim(left=0)
+    ax.set_ylabel("Huber [-]")
+    ax.set_xlabel("Epoche  [-]")
+    ax.legend(loc='upper right')
+    plt.tight_layout()
+    plt.savefig(os.path.join(hpoptimize.paths["plots"], f"{trial_number}_Huber_Loss.png"))
+    plt.close()
+
+    # Predict vs True
+    plt.scatter(y_train, train_predict, label="Trainingsdaten")
+    plt.scatter(y_test, test_predict, label="Testdaten")
+    plt.scatter(y_val, val_predict, label="Validationsdaten")
+    ax = plt.gca()
+    ax.legend(loc='upper left')
+    plt.xlabel('Reale Fließfronten [mm]', fontsize=15)
+    ax.set_xlim([-10, 120])
+    ax.set_xticks(np.arange(-10, 120, step=10))
+    plt.ylabel('Vorhergesagte Fließfronten [mm]', fontsize=15)
+    ax.set_ylim([-10, 120])
+    ax.set_yticks(np.arange(-10, 120, step=10))
+    line = mlines.Line2D([0, 1], [0, 1], color="black", alpha=0.8)
+    transform = ax.transAxes
+    line.set_transform(transform)
+    ax.add_line(line)
+    plt.tight_layout()
+    plt.savefig(os.path.join(hpoptimize.paths["plots"], f"{trial_number}_Predict_vs._True.png"))
+    plt.close()
+
+def apply_custom_chart_style(chart_all_data, y_train, y_val, y_test, train_predict, val_predict, test_predict, combined_df, worksheet_all_data):
+    max_value = max(
+        y_train.max(), y_val.max(), y_test.max(),
+        train_predict.max(), val_predict.max(), test_predict.max())
+    max_value_rounded = math.ceil(max_value)
+
+    chart_all_data.set_title({
+        "name": "True vs Predicted Values",
+        "name_font": {"size": 14, "bold": True, "color": "black"}
+    })
+    chart_all_data.set_x_axis({
+        "name": "True Values [mm]",
+        "name_font": {"size": 12, "bold": False, "color": "black"},
+        "num_font": {"size": 10, "color": "black"},
+        "line": {"color": "black", "width": 1.0},
+        "major_gridlines": {"visible": True, "line": {"color": "black", "width": 0.5}},
+        "min": 0,
+        "max": max_value_rounded
+    })
+    chart_all_data.set_y_axis({
+        "name": "Predicted Values [mm]",
+        "name_font": {"size": 12, "bold": False, "color": "black"},
+        "num_font": {"size": 10, "color": "black"},
+        "line": {"color": "black", "width": 1.0},
+        "major_gridlines": {"visible": True, "line": {"color": "black", "width": 0.5}},
+        "min": 0,
+        "max": max_value_rounded
+    })
+    chart_all_data.set_plotarea({
+        "border": {"color": "black", "width": 0.5},
+        "fill": {"color": "white"}
+    })
+    chart_all_data.set_chartarea({
+        "border": {"color": "black", "width": 0.5},
+        "fill": {"color": "white"}
+    })
+
+def save_trial_results_with_dynamic_style(trial_number, y_train, train_predict, y_test, test_predict, y_val, val_predict, history):
+    output_file = os.path.join(hpoptimize.paths["metrics"], f"Trial_{trial_number}.xlsx")
+
+    with pd.ExcelWriter(output_file, engine="xlsxwriter") as writer:
+        train_df = pd.DataFrame({
+            "True Values Train": np.array(y_train).flatten(),
+            "Predictions Train": np.array(train_predict).flatten()
+        })
+        valid_df = pd.DataFrame({
+            "True Values Validation": np.array(y_val).flatten(),
+            "Predictions Validation": np.array(val_predict).flatten()
+        })
+        test_df = pd.DataFrame({
+            "True Values Test": np.array(y_test).flatten(),
+            "Predictions Test": np.array(test_predict).flatten()
+        })
+
+        combined_df = pd.concat([train_df, valid_df, test_df], axis=1)
+        combined_df.to_excel(writer, sheet_name="All_Data", index=False, header=True)
+
+        history_df = pd.DataFrame({
+            "Epoch": range(1, len(history.history["loss"]) + 1),
+            "Train RMSE": history.history["root_mean_squared_error"],
+            "Validation RMSE": history.history["val_root_mean_squared_error"],
+            "Train Loss": history.history["loss"],
+            "Validation Loss": history.history["val_loss"]
+        })
+        history_df.to_excel(writer, sheet_name="Metrics", index=False)
+
+        workbook = writer.book
+        worksheet_all_data = writer.sheets["All_Data"]
+        chart_all_data = workbook.add_chart({"type": "scatter"})
+
+        for dataset, color, columns in zip(
+                ["Train", "Validation", "Test"],
+                ["#95BB20", "#717E86", "#00354E"],
+                [("True Values Train", "Predictions Train"),
+                 ("True Values Validation", "Predictions Validation"),
+                 ("True Values Test", "Predictions Test")]
+        ):
+            start_row = 1
+            end_row = len(combined_df)
+            chart_all_data.add_series({
+                "name": f"{dataset} Data",
+                "categories": ["All_Data", start_row, combined_df.columns.get_loc(columns[0]), end_row,
+                               combined_df.columns.get_loc(columns[0])],
+                "values": ["All_Data", start_row, combined_df.columns.get_loc(columns[1]), end_row,
+                           combined_df.columns.get_loc(columns[1])],
+                "marker": {"type": "circle", "size": 6, "fill": {"color": color}, "border": {"none": True}}
+            })
+
+        max_value = math.ceil(max(
+            y_train.max(), y_val.max(), y_test.max(),
+            train_predict.max(), val_predict.max(), test_predict.max()))
+
+        # 45°-Linie
+        worksheet_all_data.write_row(len(combined_df) + 1, 0, [0, 0])
+        worksheet_all_data.write_row(len(combined_df) + 2, 0, [max_value, max_value])
+        chart_all_data.add_series({
+            "name": None,
+            "categories": ["All_Data", len(combined_df) + 1, 0, len(combined_df) + 2, 0],
+            "values":     ["All_Data", len(combined_df) + 1, 1, len(combined_df) + 2, 1],
+            "line": {"color": "black", "dash_type": "dash", "width": 1.0},
+            "marker": {"type": "none"},
+        })
+
+        # Vertikale Linie x=max
+        worksheet_all_data.write_row(len(combined_df) + 3, 0, [max_value, 0])
+        worksheet_all_data.write_row(len(combined_df) + 4, 0, [max_value, max_value])
+        chart_all_data.add_series({
+            "categories": ["All_Data", len(combined_df) + 3, 0, len(combined_df) + 4, 0],
+            "values":     ["All_Data", len(combined_df) + 3, 1, len(combined_df) + 4, 1],
+            "line": {"color": "black", "width": 1.0},
+            "marker": {"type": "none"},
+            "name": None
+        })
+
+        # Horizontale Linie y=max
+        worksheet_all_data.write_row(len(combined_df) + 5, 0, [0, max_value])
+        worksheet_all_data.write_row(len(combined_df) + 6, 0, [max_value, max_value])
+        chart_all_data.add_series({
+            "categories": ["All_Data", len(combined_df) + 5, 0, len(combined_df) + 6, 0],
+            "values":     ["All_Data", len(combined_df) + 5, 1, len(combined_df) + 6, 1],
+            "line": {"color": "black", "width": 1.0},
+            "marker": {"type": "none"},
+            "name": None
+        })
+
+        apply_custom_chart_style(chart_all_data, y_train, y_val, y_test,
+                                 train_predict, val_predict, test_predict,
+                                 combined_df, worksheet_all_data)
+        worksheet_all_data.insert_chart("I2", chart_all_data)
+
+# ========= DATA HANDLING =========
+def load_pool_and_holdout(pool_input_file, pool_output_file, holdout_input_file, holdout_output_file, output_col):
+    x_pool = pd.read_excel(pool_input_file)
+    y_pool_all = pd.read_excel(pool_output_file)
+
+    x_test = pd.read_excel(holdout_input_file)
+    y_test_all = pd.read_excel(holdout_output_file)
+
+    if isinstance(output_col, int):
+        y_pool = y_pool_all.iloc[:, output_col]
+        y_test = y_test_all.iloc[:, output_col]
+    else:
+        y_pool = y_pool_all.loc[:, output_col]
+        y_test = y_test_all.loc[:, output_col]
+
+    return x_pool, y_pool, x_test, y_test
+
+
+def ks_train_val_split(x_pool, y_pool, val_size=0.111111):
+    y_pool = np.array(y_pool).reshape(-1, 1)
+    x_train, x_val, y_train, y_val = train_test_split(x_pool, y_pool, test_size=val_size)
+    return x_train, x_val, y_train.ravel(), y_val.ravel()
+
+def load_and_normalize_for_hpo(x_pool, y_pool, x_test, y_test, val_size=0.111111, clip=True):
+    # KS auf Pool (→ Train/Val)
+    x_train, x_val, y_train, y_val = ks_train_val_split(x_pool, y_pool, val_size=val_size)
+    y_train, y_val, y_test = map(lambda y: np.array(y).flatten(), (y_train, y_val, y_test))
+
+    # Min/Max nur auf Train
+    hpoptimize.data_min_x = np.min(x_train, axis=0).astype(np.float32)
+    hpoptimize.data_max_x = np.max(x_train, axis=0).astype(np.float32)
+    hpoptimize.data_min_y = float(np.min(y_train))
+    hpoptimize.data_max_y = float(np.max(y_train))
+    eps = 1e-12
+
+    def nx(dfX):
+        return (dfX - hpoptimize.data_min_x) / (hpoptimize.data_max_x - hpoptimize.data_min_x + eps)
+
+    def ny(srY):
+        normed = (srY - hpoptimize.data_min_y) / (hpoptimize.data_max_y - hpoptimize.data_min_y + eps)
+        return np.clip(normed, 0.0, 1.0) if clip else normed
+
+    return nx(x_train), ny(y_train), nx(x_val), ny(y_val), nx(x_test), ny(y_test)
+
+# ========= (DE-)NORMALISIERUNG =========
+def unnormalize_x(x_norm):
+    return x_norm * (hpoptimize.data_max_x - hpoptimize.data_min_x) + hpoptimize.data_min_x
+
+def unnormalize_y(y_norm):
+    return y_norm * (hpoptimize.data_max_y - hpoptimize.data_min_y) + hpoptimize.data_min_y
+
+# ========= SPLIT DUMP =========
+def save_split_data(x_train, y_train, x_val, y_val, x_test, y_test):
+    """
+    Speichert die (ggf. normalisierten) Train/Val/Test-Splits als Excel
+    (jeweils letzter Spalteneintrag = y).
+    """
+    output_folder = f"Ergebnisse/{hpoptimize.study_name}"
+    os.makedirs(output_folder, exist_ok=True)
+    file_path = os.path.join(hpoptimize.paths["data"], f"Split_Daten_{hpoptimize.study_name}.xlsx")
+
+    y_train = np.array(y_train).flatten()
+    y_val = np.array(y_val).flatten()
+    y_test = np.array(y_test).flatten()
+
+    with pd.ExcelWriter(file_path, engine="xlsxwriter") as writer:
+        train_df = pd.concat([x_train.reset_index(drop=True),
+                              pd.Series(y_train).reset_index(drop=True).rename('target')], axis=1)
+        train_df.to_excel(writer, sheet_name="Train", index=False)
+
+        val_df = pd.concat([x_val.reset_index(drop=True),
+                            pd.Series(y_val).reset_index(drop=True).rename('target')], axis=1)
+        val_df.to_excel(writer, sheet_name="Validation", index=False)
+
+        test_df = pd.concat([x_test.reset_index(drop=True),
+                             pd.Series(y_test).reset_index(drop=True).rename('target')], axis=1)
+        test_df.to_excel(writer, sheet_name="Test", index=False)
+
+# ========= MODELL =========
+def create_model(trial):
+    n_layers = trial.suggest_int(name="n_Layers", low=1, high=3)
+    learning_rate = trial.suggest_float(name="Learning_Rate", low=0.0001, high=1, log=True)
+    weight_decay  = trial.suggest_float(name="Weight_Decay",  low=1e-10,  high=1e-3, log=True)
+
+    model = keras.Sequential()
+    model.add(keras.layers.Flatten())
+
+    for i in range(n_layers):
+        act_func  = trial.suggest_categorical(f"act_func_l{i}", ["tanh", "relu"])
+        num_units = trial.suggest_int(f"n_units_l{i}", 4, 128, log=True)
+        model.add(
+            keras.layers.Dense(
+                num_units,
+                activation=act_func,
+                kernel_regularizer=keras.regularizers.l2(weight_decay),
+            )
+        )
+
+    model.add(keras.layers.Dense(1, kernel_regularizer=tf.keras.regularizers.l2(weight_decay)))
+
+    model.compile(
+        loss=keras.losses.Huber(),
+        metrics=[keras.metrics.RootMeanSquaredError()],
+        optimizer=keras.optimizers.AdamW(learning_rate=learning_rate, weight_decay=weight_decay),
+    )
+    return model
+
+# ========= OBJECTIVE =========
+def objective(trial):
+    global current_model
+    global x_train_glob, y_train_glob, x_val_glob, y_val_glob, x_test_glob, y_test_glob
+
+    x_train, y_train = x_train_glob, y_train_glob
+    x_val, y_val = x_val_glob, y_val_glob
+    x_test, y_test = x_test_glob, y_test_glob
+
+    # Reproduzierbarkeit
+    os.environ['PYTHONHASHSEED'] = str(hpoptimize.seed)
+    np.random.seed(hpoptimize.seed)
+    tf.random.set_seed(hpoptimize.seed)
+    tf.keras.utils.set_random_seed(hpoptimize.seed)
+    tf.config.experimental.enable_op_determinism()
+
+    # Erstelle Modell
+    model = create_model(trial)
+    current_model = model  # Update the global model reference
+
+    # Parameter Callback
+    callback = [
+        keras.callbacks.EarlyStopping(
+            monitor='val_root_mean_squared_error',
+            patience=hpoptimize.patience,
+            mode="min"),
+        keras.callbacks.ModelCheckpoint(
+            hpoptimize.model_file,
+            monitor="val_root_mean_squared_error",
+            mode="min",
+            save_best_only=True,
+            verbose=0),
+        TFKerasPruningCallback(trial, 'val_root_mean_squared_error')
+    ]
+
+    batch_size = trial.suggest_int("Batch_Size", low=1, high=32, log=True)
+
+    # Fit
+    try:
+        history = model.fit(
+            x_train, y_train,
+            validation_data=(x_val, y_val),
+            batch_size=batch_size,
+            epochs=hpoptimize.epochs,
+            verbose=0,
+            shuffle=True,
+            callbacks=callback
+        )
+
+    except optuna.exceptions.TrialPruned:
+        print(f"Trial {trial.number} wurde gepruned.")
+        trial.set_user_attr("pruned", True)
+        raise
+
+    with tf.device('/CPU:0'):
+        _train_pred = model.predict(x_train, verbose=0).astype(np.float32).ravel()
+        _val_pred = model.predict(x_val, verbose=0).astype(np.float32).ravel()
+        _test_pred = model.predict(x_test, verbose=0).astype(np.float32).ravel()
+
+    if np.std(_val_pred) < 1e-6 or np.std(_test_pred) < 1e-6:
+        # Optional: als schlecht zurückgeben oder prunen
+        raise optuna.TrialPruned(f"Constant predictions (std<1e-6), pruning trial {trial.number}.")
+
+    # Bestes Modell laden
+    if os.path.exists(hpoptimize.model_file):
+        best_model = keras.models.load_model(hpoptimize.model_file)
+    else:
+        print("Warnung: Modelldatei nicht gefunden! Speichere das letzte Modell stattdessen.")
+        best_model = model
+        best_model.save(hpoptimize.model_file)
+
+    # Vorhersagen (unnormalisiert für RMSE/R2)
+    print("train: ")
+    train_predict = best_model.predict(x_train)
+    y_train_unn = unnormalize_y(y_train)
+    train_pred_unn = unnormalize_y(train_predict)
+    train_rmse = root_mean_squared_error(y_train_unn, train_pred_unn)
+    train_r2 = r2_score(y_train_unn, train_pred_unn)
+
+    print("val: ")
+    val_predict = best_model.predict(x_val)
+    y_val_unn = unnormalize_y(y_val)
+    val_pred_unn = unnormalize_y(val_predict)
+    val_rmse = root_mean_squared_error(y_val_unn, val_pred_unn)
+    val_r2 = r2_score(y_val_unn, val_pred_unn)
+
+    print("test: ")
+    test_predict = best_model.predict(x_test)
+    y_test_unn = unnormalize_y(y_test)
+    test_pred_unn = unnormalize_y(test_predict)
+    test_rmse = root_mean_squared_error(y_test_unn, test_pred_unn)
+    test_r2 = r2_score(y_test_unn, test_pred_unn)
+
+    print("Pred train std:", np.std(train_predict))
+    print("Pred val std:", np.std(val_predict))
+    print("Pred test std:", np.std(test_predict))
+
+    # Excel/Plots
+    save_trial_results_with_dynamic_style(
+        trial.number, y_train_unn, train_pred_unn, y_test_unn, test_pred_unn, y_val_unn, val_pred_unn, history)
+
+    # Trial-Attrs
+    trial.set_user_attr("train_r2",  train_r2)
+    trial.set_user_attr("val_r2",    val_r2)
+    trial.set_user_attr("test_r2",   test_r2)
+    trial.set_user_attr("train_rmse", train_rmse)
+    trial.set_user_attr("val_rmse",   val_rmse)
+    trial.set_user_attr("test_rmse",  test_rmse)
+
+    # Modell speichern
+    model_path = os.path.join(hpoptimize.paths["models"], f"{hpoptimize.study_name}_{trial.number}.keras")
+    best_model.save(model_path)
+
+    # Plots
+    plot_graphs(history, trial.number,
+                y_train_unn, train_pred_unn,
+                y_val_unn,   val_pred_unn,
+                y_test_unn,  test_pred_unn)
+
+    # Metriken CSV
+    metrics_df = pd.DataFrame({
+        'Dataset': ['Train', 'Validation', 'Test'],
+        'RMSE': [train_rmse, val_rmse, test_rmse],
+        'R2': [train_r2, val_r2, test_r2]
+    })
+    metrics_df.to_csv(os.path.join(hpoptimize.paths["metrics"], f"metrics_{trial.number}.csv"), index=False)
+
+    if np.isnan(val_rmse):
+        print(f"Trial {trial.number}: val_rmse ist NaN!")
+
+    return val_rmse
+
+# ========= STUDY SAVE =========
+def save_study_results():
+    global current_study
+    if current_study:
+        print("\nSaving study results...")
+        study_name = hpoptimize.study_name
+        study_path = f"Ergebnisse/{study_name}"
+        os.makedirs(study_path, exist_ok=True)
+        study_file = f"{study_path}/{study_name}.xlsx"
+        current_study.trials_dataframe().to_excel(study_file)
+        print(f"Study results saved to: {study_file}")
+
+atexit.register(save_study_results)
+
+def save_model_and_study_on_interrupt(signum, frame):
+    global current_model, current_study
+    if current_model:
+        print("\nProgram interrupted. Saving the current model...")
+        current_model.save("interrupted_model.keras")
+        print("Model saved as 'interrupted_model.keras'.")
+    save_study_results()
+    print("Exiting program.")
+    exit(0)
+
+signal.signal(signal.SIGINT, save_model_and_study_on_interrupt)
+
+# ========= RUN HPO =========
+def run_hpo(study_name, seed, patience, epochs, n_trials, pool_input_file, pool_output_file, holdout_input_file, holdout_output_file, output_col, val_size=0.111111):
+    """
+    Führt die HPO-Pipeline aus:
+    - Initialisiert Pfade,
+    - erzeugt Train/Val (KS) aus 'pool_file', lädt fixes Holdout aus 'holdout_file',
+    - normalisiert (Fit auf Train), speichert Splits (normiert & unnormiert),
+    - führt Optuna-Optimierung aus,
+    - räumt Modelle/Plots auf.
+    """
+    global current_study, x_pool, y_pool, x_test, y_test
+    initialize(study_name, seed, patience, epochs, n_trials)
+
+    # Ergebnisstruktur
+    base_dir = f"Ergebnisse/{hpoptimize.study_name}"
+    hpoptimize.paths = {
+        "base": base_dir,
+        "models": os.path.join(base_dir, "models"),
+        "plots": os.path.join(base_dir, "plots"),
+        "metrics": os.path.join(base_dir, "metrics"),
+        "data": os.path.join(base_dir, "data")
+    }
+    for path in hpoptimize.paths.values():
+        os.makedirs(path, exist_ok=True)
+
+    # Einmalige Splits (Norm/Unnorm) speichern für Reproduzierbarkeit
+    # Pool + Holdout laden
+    x_pool, y_pool, x_test, y_test = load_pool_and_holdout(
+        pool_input_file, pool_output_file,
+        holdout_input_file, holdout_output_file,
+        output_col
+    )
+
+    # Normalisieren + KS-Split
+    global x_train_glob, y_train_glob, x_val_glob, y_val_glob, x_test_glob, y_test_glob
+    x_train_glob, y_train_glob, x_val_glob, y_val_glob, x_test_glob, y_test_glob = load_and_normalize_for_hpo(
+        x_pool, y_pool, x_test, y_test, val_size=val_size
+    )
+
+    # Splits speichern
+    save_split_data(x_train_glob, y_train_glob, x_val_glob, y_val_glob, x_test_glob, y_test_glob)  # normierte
+    save_split_data(
+        unnormalize_x(x_train_glob), unnormalize_y(y_train_glob),
+        unnormalize_x(x_val_glob), unnormalize_y(y_val_glob),
+        unnormalize_x(x_test_glob), unnormalize_y(y_test_glob)
+    )
+
+    sampler = optuna.samplers.TPESampler(seed=hpoptimize.seed, multivariate=True, n_startup_trials=50)
+    pruner = optuna.pruners.MedianPruner(n_startup_trials=200, n_warmup_steps=500, interval_steps=50)
+
+    study = optuna.create_study(
+        direction="minimize",
+        sampler=sampler,
+        pruner=pruner,
+        study_name=hpoptimize.study_name,
+        storage=f"sqlite:///{os.path.join(base_dir, hpoptimize.study_name + '.sqlite3')}",
+        load_if_exists=True
+    )
+
+    current_study = study
+    study.optimize(objective, n_trials=hpoptimize.n_trials)
+
+    save_study_results()
+
+    # Cleanup: nur Top-10 Modelle/Plots behalten
+    print("Deleting models except the best 10...")
+    top_10_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    top_10_trials = sorted(top_10_trials, key=lambda t: t.value)[:10]
+
+    if not top_10_trials:
+        print("Warnung: Keine erfolgreichen Trials gefunden. Es werden keine Modelle oder Plots gelöscht.")
+        return
+
+    top_10_model_files = {
+        os.path.join(hpoptimize.paths["models"], f"{hpoptimize.study_name}_{trial.number}.keras")
+        for trial in top_10_trials
+    }
+    top_10_plot_files = {
+        os.path.join(hpoptimize.paths["plots"], f"{trial.number}_RMSE.png") for trial in top_10_trials
+    } | {
+        os.path.join(hpoptimize.paths["plots"], f"{trial.number}_Huber_Loss.png") for trial in top_10_trials
+    } | {
+        os.path.join(hpoptimize.paths["plots"], f"{trial.number}_Predict_vs._True.png") for trial in top_10_trials
+    }
+
+    all_model_files = glob.glob(f"{hpoptimize.paths['models']}/*.keras")
+    all_plot_files  = glob.glob(f"{hpoptimize.paths['plots']}/*.png")
+
+    print("Top 10 Trials (nach val_rmse):")
+    for t in top_10_trials:
+        print(f"Trial {t.number}: value = {t.value}")
+
+    print("Alle gespeicherten Modell-Dateien:")
+    for file in all_model_files:
+        print(" -", file)
+
+    print("Top 10 erlaubte Modelle:")
+    for file in top_10_model_files:
+        print(" ✓", file)
+
+    deleted_models = 0
+    deleted_plots = 0
+
+    for model_file in all_model_files:
+        if model_file not in top_10_model_files and os.path.basename(model_file).startswith(hpoptimize.study_name):
+            try:
+                os.remove(model_file)
+                print(f"Modell gelöscht: {model_file}")
+                deleted_models += 1
+            except FileNotFoundError:
+                pass
+
+    for plot_file in all_plot_files:
+        if plot_file not in top_10_plot_files:
+            try:
+                os.remove(plot_file)
+                print(f"Plot gelöscht: {plot_file}")
+                deleted_plots += 1
+            except FileNotFoundError:
+                pass
+
+    print(f"Cleanup abgeschlossen: {deleted_models} Modelle und {deleted_plots} Plots wurden gelöscht.")
+
+# ========= MAIN =========
+if __name__ == '__main__':
+    # 4 Pläne iterieren – alle nutzen dasselbe fixe Holdout
+    holdout_input_file = r"Getrennte_Daten/Holdout_Modell_1_Input.xlsx"
+    holdout_output_file = r"Getrennte_Daten/Holdout_Modell_1_Output.xlsx"
+
+    study = "Study_17_09_2025_Taguchi_Modell_1.3_KS_Holdout_seed_999"
+
+    pool_input_file = r"Getrennte_Daten/Pool_Taguchi_Modell_1_Input.xlsx"
+    pool_output_file = r"Getrennte_Daten/Pool_Taguchi_Modell_1_Output.xlsx"
+
+    run_hpo(
+        study_name=study,
+        seed=999,
+        patience=100,
+        n_trials=500,
+        epochs=1000,
+        pool_input_file=pool_input_file,
+        pool_output_file=pool_output_file,
+        holdout_input_file=holdout_input_file,
+        holdout_output_file=holdout_output_file,
+        output_col="Knoten_3",
+        val_size=0.111111,
+    )
+
+####################################################################
+
+def retest_promising_trials(study, x_train, y_train, x_val, y_val, x_test, y_test,
+                            threshold=0.05, max_retest=10):
+    """
+    Retestet Trials, die entweder COMPLETE oder PRUNED sind und deren bestes val_rmse
+    besser ist als der Threshold. So gehen gute, früh geprunte Modelle nicht verloren.
+
+    :param study: Optuna Study
+    :param threshold: Schwellenwert für val_rmse, z. B. 0.05
+    :param max_retest: maximale Anzahl Trials, die neu trainiert werden
+    """
+    # Kandidaten sammeln
+    candidates = []
+    for t in study.trials:
+        if t.state == optuna.trial.TrialState.COMPLETE:
+            score = t.value
+        elif t.state == optuna.trial.TrialState.PRUNED:
+            score = t.user_attrs.get("best_val_rmse_before_prune", np.inf)
+        else:
+            continue
+        if score < threshold:
+            candidates.append((t, score))
+
+    if not candidates:
+        print("Keine Trials unterhalb des Schwellenwerts gefunden.")
+        return
+
+    # sortiere nach Score und beschränke auf max_retest
+    candidates = sorted(candidates, key=lambda x: x[1])[:max_retest]
+
+    print(f"\n Retest von {len(candidates)} Trials (Threshold={threshold})...\n")
+
+    for trial, score in candidates:
+        print(f"Retest Trial {trial.number}, state={trial.state}, "
+              f"ursprüngliches bestes val_rmse={score:.4f}")
+
+        # Modell mit gleichen Hyperparametern bauen
+        model = create_model(trial)
+
+        model_path = os.path.join(hpoptimize.paths["models"], f"Retest_{trial.number}.keras")
+        callbacks = [
+            keras.callbacks.EarlyStopping(
+                monitor="val_root_mean_squared_error",
+                patience=hpoptimize.patience,
+                mode="min"
+            ),
+            keras.callbacks.ModelCheckpoint(
+                model_path,
+                monitor="val_root_mean_squared_error",
+                save_best_only=True,
+                mode="min",
+                verbose=0
+            )
+        ]
+
+        history = model.fit(
+            x_train, y_train,
+            validation_data=(x_val, y_val),
+            batch_size=trial.params["Batch_Size"],
+            epochs=hpoptimize.epochs,
+            verbose=0,
+            shuffle=True,
+            callbacks=callbacks
+        )
+
+        best_model = keras.models.load_model(model_path)
+
+        # Auswertung
+        train_pred = best_model.predict(x_train)
+        val_pred   = best_model.predict(x_val)
+        test_pred  = best_model.predict(x_test)
+
+        y_train_un = unnormalize_y(y_train)
+        y_val_un   = unnormalize_y(y_val)
+        y_test_un  = unnormalize_y(y_test)
+
+        train_rmse = root_mean_squared_error(y_train_un, unnormalize_y(train_pred))
+        val_rmse   = root_mean_squared_error(y_val_un, unnormalize_y(val_pred))
+        test_rmse  = root_mean_squared_error(y_test_un, unnormalize_y(test_pred))
+
+        print(f"Neues Ergebnis: Val RMSE={val_rmse:.4f}, Test RMSE={test_rmse:.4f}\n")
+
+        # optional: Ergebnisse speichern wie im normalen objective
+        save_trial_results_with_dynamic_style(
+            f"Retest_{trial.number}",
+            y_train_un, unnormalize_y(train_pred),
+            y_test_un,  unnormalize_y(test_pred),
+            y_val_un,   unnormalize_y(val_pred),
+            history
+        )
+
+----------- Reevaluieren Version 1 ---------------
+import os
+import re
+import glob
+import argparse
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from sklearn.metrics import root_mean_squared_error, r2_score
+import optuna
+import sys
+import subprocess
+
+import Modell_Training_Hyperparameteroptimierung as hpo
+
+
+# -------- Helpers --------
+class SimpleHistory:
+    """Dummy-History mit den Keys wie bei Keras, 1 Punkt (Epoch 1)."""
+    def __init__(self, train_rmse, val_rmse, train_loss, val_loss):
+        self.history = {
+            "root_mean_squared_error": [float(train_rmse)],
+            "val_root_mean_squared_error": [float(val_rmse)],
+            "loss": [float(train_loss)],
+            "val_loss": [float(val_loss)],
+        }
+
+def huber_loss(y_true, y_pred, delta=1.0):
+    err = np.asarray(y_true, dtype=np.float64) - np.asarray(y_pred, dtype=np.float64)
+    abs_e = np.abs(err)
+    quad = 0.5 * (err**2)
+    lin  = delta * (abs_e - 0.5 * delta)
+    return np.where(abs_e <= delta, quad, lin).mean()
+
+def extract_trial_number(model_filename, fallback=None):
+    """Erwartet <StudyName>_<trial>.keras → gibt die Trialnummer zurück."""
+    base = os.path.splitext(os.path.basename(model_filename))[0]
+    m = re.search(r"_(\d+)$", base)
+    return int(m.group(1)) if m else fallback
+
+
+# -------- Core setup --------
+def setup_hp_context(study_name: str, pool_path: str, test_path: str):
+    """
+    Initialisiert hpo.hpoptimize „leichtgewichtig“ (ohne Training),
+    setzt Pfade und Min/Max über hpo.data().
+    """
+    hpo.hpoptimize = hpo.Optimization(
+        study_name=study_name,
+        seed=0, patience=0, epochs=1, n_trials=1,
+        train_data=pool_path, test_data=test_path
+    )
+    base_dir = os.path.join("Ergebnisse", study_name)
+    hpo.hpoptimize.paths = {
+        "base": base_dir,
+        "models": os.path.join(base_dir, "models"),
+        "plots": os.path.join(base_dir, "plots"),
+        "metrics": os.path.join(base_dir, "metrics"),
+        "data": os.path.join(base_dir, "data"),
+    }
+    for p in hpo.hpoptimize.paths.values():
+        os.makedirs(p, exist_ok=True)
+
+    # 1x data() aufrufen → setzt data_min/max_x/y; liefert Splits (normalisiert)
+    x_train, y_train, x_val, y_val, x_test_placeholder, y_test_placeholder = hpo.data()
+    return x_train, y_train, x_val, y_val
+
+
+def load_splits_from_datafile_or_fallback(study_name: str, x_train, y_train, x_val, y_val,
+                                          new_test_path: str):
+    """
+    Lädt Train/Val aus gespeicherter Split-Datei, wenn vorhanden (unnormalisiert),
+    normalisiert sie mit hpoptimize Min/Max; ansonsten verwendet die übergebenen
+    Splits aus hpo.data().
+    Test wird immer aus 'new_test_path' geladen und mit Min/Max normalisiert.
+    """
+    # Test einlesen (unnormiert) und normalisieren wie im Hauptskript
+    holdout_df = pd.read_excel(new_test_path)
+    X_te_raw = holdout_df.iloc[:, :10].astype(float)
+    y_te_raw = holdout_df.iloc[:, -2].astype(float)
+    X_te = (X_te_raw - hpo.hpoptimize.data_min_x) / (hpo.hpoptimize.data_max_x - hpo.hpoptimize.data_min_x)
+    y_te = (y_te_raw - hpo.hpoptimize.data_min_y) / (hpo.hpoptimize.data_max_y - hpo.hpoptimize.data_min_y)
+
+    # Versuche gespeicherte Splits zu laden (unnormiert)
+    split_file = os.path.join(hpo.hpoptimize.paths["data"], f"Split_Daten_{hpo.hpoptimize.study_name}.xlsx")
+    if os.path.exists(split_file):
+        try:
+            df_tr = pd.read_excel(split_file, sheet_name="Train")
+            df_va = pd.read_excel(split_file, sheet_name="Validation")
+            # Annahme: erste 10 Spalten X, vorletzte Spalte y (wie im Hauptskript)
+            X_tr_raw = df_tr.iloc[:, :10].astype(float)
+            y_tr_raw = df_tr.iloc[:, -1].astype(float)  # in der gespeicherten Datei ist y die letzte Spalte
+            X_va_raw = df_va.iloc[:, :10].astype(float)
+            y_va_raw = df_va.iloc[:, -1].astype(float)
+
+            X_tr = (X_tr_raw - hpo.hpoptimize.data_min_x) / (hpo.hpoptimize.data_max_x - hpo.hpoptimize.data_min_x)
+            y_tr = (y_tr_raw - hpo.hpoptimize.data_min_y) / (hpo.hpoptimize.data_max_y - hpo.hpoptimize.data_min_y)
+
+            X_va = (X_va_raw - hpo.hpoptimize.data_min_x) / (hpo.hpoptimize.data_max_x - hpo.hpoptimize.data_min_x)
+            y_va = (y_va_raw - hpo.hpoptimize.data_min_y) / (hpo.hpoptimize.data_max_y - hpo.hpoptimize.data_min_y)
+        except Exception:
+            # Fallback auf Splits aus hpo.data()
+            X_tr, y_tr, X_va, y_va = x_train, y_train, x_val, y_val
+    else:
+        X_tr, y_tr, X_va, y_va = x_train, y_train, x_val, y_val
+
+    return X_tr, y_tr, X_va, y_va, X_te, y_te, y_te_raw
+
+
+def update_study_user_attrs(study_name: str, updated: dict):
+    """
+    Aktualisiert test_rmse / test_r2 in der Optuna-DB und schreibt eine neue Study-Excel.
+    :param updated: dict {trial_number: (test_rmse, test_r2)}
+    """
+    base_dir = os.path.join("Ergebnisse", study_name)
+    storage = f"sqlite:///{os.path.join(base_dir, study_name + '.sqlite3')}"
+    try:
+        study = optuna.load_study(study_name=study_name, storage=storage)
+    except Exception as e:
+        print(f"[WARN] Study konnte nicht geladen werden ({e}). Überspringe DB-Update.")
+        return
+
+    # Trials-User-Attrs aktualisieren
+    for t in study.trials:
+        if t.number in updated:
+            rmse, r2 = updated[t.number]
+            t.set_user_attr("test_rmse", float(rmse))
+            t.set_user_attr("test_r2", float(r2))
+
+    # frische Excel sichern
+    df = study.trials_dataframe()
+    df.to_excel(os.path.join(base_dir, f"{study_name}_ReEval.xlsx"), index=False)
+    print(f"Study-User-Attrs aktualisiert und nach {study_name}_ReEval.xlsx exportiert.")
+
+
+def reevaluate(study_name: str, pool_data: str, new_test_data: str, overwrite: bool=True):
+    # 1) hp-Kontext aufsetzen + Min/Max bereitstellen
+    x_tr0, y_tr0, x_va0, y_va0 = setup_hp_context(study_name, pool_data, new_test_data)
+
+    # 2) Splits laden (möglichst aus gespeicherter Datei), Test aus neuem Holdout
+    X_tr, y_tr, X_va, y_va, X_te, y_te, y_te_raw = load_splits_from_datafile_or_fallback(
+        study_name, x_tr0, y_tr0, x_va0, y_va0, new_test_data
+    )
+
+    # Un-Normalisierung benutzt exakt deine Funktion aus dem Hauptskript
+    unY = hpo.unnormalize_y
+    y_tr_true = pd.Series(unY(y_tr))
+    y_va_true = pd.Series(unY(y_va))
+    y_te_true = pd.Series(y_te_raw)  # schon unnormiert aus Datei
+
+    base_dir    = os.path.join("Ergebnisse", study_name)
+    model_dir   = os.path.join(base_dir, "models")
+    plots_dir   = os.path.join(base_dir, "plots")
+    metrics_dir = os.path.join(base_dir, "metrics")
+    os.makedirs(plots_dir, exist_ok=True)
+    os.makedirs(metrics_dir, exist_ok=True)
+
+    if overwrite:
+        # Nur Re-Eval-Artefakte (Leaderboards) vorab löschen; per-Trial-Dateien werden unten überschrieben
+        for pat in ("leaderboard_reeval.csv", "leaderboard_top10_reeval.csv"):
+            p = os.path.join(metrics_dir, pat)
+            if os.path.exists(p):
+                os.remove(p)
+
+    model_paths = sorted(glob.glob(os.path.join(model_dir, "*.keras")))
+    if not model_paths:
+        raise FileNotFoundError(f"Keine .keras-Modelle in {model_dir} gefunden.")
+
+    rows = []
+    new_user_attrs = {}
+
+    for mp in model_paths:
+        trial_num = extract_trial_number(mp)
+        model_name = os.path.basename(mp)
+
+        try:
+            model = tf.keras.models.load_model(mp)
+
+            # Vorhersage (normiert rein → normierte y_hat raus)
+            yp_tr = model.predict(np.asarray(X_tr), verbose=0).reshape(-1)
+            yp_va = model.predict(np.asarray(X_va), verbose=0).reshape(-1)
+            yp_te = model.predict(np.asarray(X_te), verbose=0).reshape(-1)
+
+            # Un-Normalisieren
+            yhat_tr = pd.Series(unY(yp_tr))
+            yhat_va = pd.Series(unY(yp_va))
+            yhat_te = pd.Series(unY(yp_te))
+
+            # Metriken
+            train_rmse = root_mean_squared_error(y_tr_true, yhat_tr)
+            val_rmse   = root_mean_squared_error(y_va_true, yhat_va)
+            test_rmse  = root_mean_squared_error(y_te_true, yhat_te)
+
+            train_r2 = r2_score(y_tr_true, yhat_tr)
+            val_r2   = r2_score(y_va_true, yhat_va)
+            test_r2  = r2_score(y_te_true, yhat_te)
+
+            # Huber für History-Dummy
+            train_huber = huber_loss(y_tr_true, yhat_tr)
+            val_huber   = huber_loss(y_va_true, yhat_va)
+            hist = SimpleHistory(train_rmse, val_rmse, train_huber, val_huber)
+
+            # === Artefakte „wie Training“ erzeugen/ersetzen ===
+            # Excel je Trial
+            hpo.save_trial_results_with_dynamic_style(
+                trial_number=(trial_num if trial_num is not None else "reeval"),
+                y_train=y_tr_true, train_predict=yhat_tr,
+                y_test=y_te_true,  test_predict=yhat_te,
+                y_val=y_va_true,   val_predict=yhat_va,
+                history=hist
+            )
+            # Plots je Trial
+            hpo.plot_graphs(
+                history=hist,
+                trial_number=(trial_num if trial_num is not None else "reeval"),
+                y_train=y_tr_true,  train_predict=yhat_tr,
+                y_val=y_va_true,    val_predict=yhat_va,
+                y_test=y_te_true,   test_predict=yhat_te
+            )
+            # Per-Trial-Metrik CSV (überschreiben)
+            if trial_num is not None:
+                pd.DataFrame({
+                    "Dataset": ["Train", "Validation", "Test"],
+                    "RMSE": [train_rmse, val_rmse, test_rmse],
+                    "R2":   [train_r2,   val_r2,   test_r2],
+                }).to_csv(os.path.join(metrics_dir, f"metrics_{trial_num}.csv"), index=False)
+
+            # Leaderboard-Row
+            rows.append({
+                "model_file": model_name,
+                "trial": trial_num,
+                "train_rmse": float(train_rmse), "train_r2": float(train_r2),
+                "val_rmse": float(val_rmse),     "val_r2": float(val_r2),
+                "test_rmse": float(test_rmse),   "test_r2": float(test_r2),
+            })
+
+            # Für Study-Update merken (nur Testwerte sind neu)
+            if trial_num is not None:
+                new_user_attrs[trial_num] = (float(test_rmse), float(test_r2))
+
+            print(f"{model_name:45s}  ✓  Test RMSE={test_rmse:.6f}  R²={test_r2:.6f}")
+
+        except Exception as e:
+            print(f"[WARN] {model_name} konnte nicht reevaluated werden: {e}")
+
+    # Leaderboard speichern
+    if rows:
+        leaderboard = pd.DataFrame(rows).sort_values("test_rmse", ascending=True)
+        leaderboard.to_csv(os.path.join(metrics_dir, "leaderboard_reeval.csv"), index=False)
+        if len(leaderboard) > 10:
+            leaderboard.head(10).to_csv(os.path.join(metrics_dir, "leaderboard_top10_reeval.csv"), index=False)
+
+    # Study-User-Attrs aktualisieren
+    if new_user_attrs:
+        update_study_user_attrs(study_name, new_user_attrs)
+
+
+    def main():
+        ap = argparse.ArgumentParser(description="Re-Evaluation aller gespeicherten Modelle über das Hauptskript (voller Artefakt-Output).")
+        ap.add_argument("--study_name", required=True, help="Name der Study (Ordner unter Ergebnisse/).")
+        ap.add_argument("--pool_data", required=True, help="Pfad zu Pool/Train-Excel (wie beim Training).")
+        ap.add_argument("--new_test_data", required=True, help="Pfad zum BEREINIGTEN Holdout/Test-Excel.")
+        ap.add_argument("--no_overwrite", action="store_true", help="Vorhandene Re-Eval-Leaderboards NICHT löschen.")
+        args = ap.parse_args()
+
+        reevaluate(
+            study_name=args.study_name,
+            pool_data=args.pool_data,
+            new_test_data=args.new_test_data,
+            overwrite=not args.no_overwrite
+        )
+
+        # === (NEU) Aktualisiere bestehende Split-Datei mit bereinigtem Testset ===
+        split_file_path = os.path.join(
+            hpo.hpoptimize.paths["data"],
+            f"Split_Daten_{hpo.hpoptimize.study_name}.xlsx"
+        )
+
+        if os.path.exists(split_file_path):
+            # Lade bestehende Sheets (Train/Validation), überschreibe nur Test
+            with pd.ExcelWriter(split_file_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+                test_df = pd.concat([
+                    pd.DataFrame(hpo.unnormalize_x(X_te), columns=X_tr.columns).reset_index(drop=True),
+                    y_te_true.reset_index(drop=True)
+                ], axis=1)
+                test_df.columns = [*X_te.columns, "Target"]
+                test_df.to_excel(writer, sheet_name="Test (bereinigt)", index=False)
+
+            print(f"\n📄 Testdaten-Sheet in bestehender Split-Datei ersetzt:\n{split_file_path}")
+
+        else:
+            # Falls Datei fehlt, lege sie komplett neu an (zur Sicherheit)
+            os.makedirs(hpo.hpoptimize.paths["data"], exist_ok=True)
+            with pd.ExcelWriter(split_file_path, engine="xlsxwriter") as writer:
+                train_df = pd.concat([
+                    hpo.unnormalize_x(X_tr).reset_index(drop=True),
+                    pd.Series(hpo.unnormalize_y(y_tr)).reset_index(drop=True)
+                ], axis=1)
+                train_df.columns = [*X_tr.columns, "Target"]
+                train_df.to_excel(writer, sheet_name="Train", index=False)
+
+                val_df = pd.concat([
+                    hpo.unnormalize_x(X_va).reset_index(drop=True),
+                    pd.Series(hpo.unnormalize_y(y_va)).reset_index(drop=True)
+                ], axis=1)
+                val_df.columns = [*X_va.columns, "Target"]
+                val_df.to_excel(writer, sheet_name="Validation", index=False)
+
+                test_df = pd.concat([
+                    pd.DataFrame(hpo.unnormalize_x(X_te), columns=X_tr.columns).reset_index(drop=True),
+                    y_te_true.reset_index(drop=True)
+                ], axis=1)
+                test_df.columns = [*X_te.columns, "Target"]
+                test_df.to_excel(writer, sheet_name="Test (bereinigt)", index=False)
+
+            print(f"\n📄 Split-Datei nicht gefunden – neu erstellt mit bereinigtem Testset:\n{split_file_path}")
+
+
+if __name__ == '__main__':
+    # === Trainingsteil ===
+    holdout_data = r"Getrennte_Daten/Holdout_fixed_Modell_1.xlsx"
+    pool_data = r"Getrennte_Daten/Pool_Sobol_Modell_1.xlsx"
+    study_name = "Study_15_10_2025_Sobol_Modell_1.3_KS_Holdout_seed_0"
+
+    hpo.run_hpo(
+        study_name=study_name,
+        seed=0,
+        patience=100,
+        n_trials=500,
+        epochs=1000,
+        train_data=pool_data,
+        test_data=holdout_data
+    )
+
+    # === Nach Abschluss: automatische Re-Evaluation starten ===
+    print("\n===== Starte automatische Re-Evaluation mit bereinigtem Testset =====\n")
+
+    reeval_script = "reeval_from_main_full.py"  # Dateiname deines Reevaluation-Skripts
+    new_test_data = r"Getrennte_Daten/Holdout_fixed_Modell_1_CORRECT.xlsx"
+
+    subprocess.run([
+        sys.executable, reeval_script,
+        "--study_name", study_name,
+        "--pool_data", pool_data,
+        "--new_test_data", new_test_data
+    ])
+
+    print("\n===== Re-Evaluation abgeschlossen =====\n")
+
+
+    -------------------------------------------------------------
+
+    import numpy as np
+import pandas as pd
+from sklearn.preprocessing import RobustScaler
+from numpy.linalg import norm
+import os
+
+# ============================
+# --- Einstellungen ----------
+# ============================
+
+OUT_DIR  = r"Getrennte_Daten"
+N_TEST   = 391           # ~10% des Gesamtdatensets
+PLAN_COL = "Versuchsplan"
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ============================
+# --- Daten laden ------------
+# ============================
+
+df_taguchi = pd.read_excel('Daten/Taguchi_Fliessfronten_Auslenkung.xlsx').assign(Versuchsplan="Taguchi")
+df_lhs     = pd.read_excel('Daten/LHS_Fliessfronten_Auslenkung.xlsx').assign(Versuchsplan="LHS")
+df_sobol   = pd.read_excel('Daten/Sobol_Fliessfronten_Auslenkung.xlsx').assign(Versuchsplan="Sobol")
+df_halton  = pd.read_excel('Daten/Halton_Fliessfronten_Auslenkung.xlsx').assign(Versuchsplan="Halton")
+
+# Alle Pläne zusammenführen
+df_all = pd.concat([df_taguchi, df_lhs, df_sobol, df_halton], ignore_index=True)
+
+# ============================
+# --- Spalten definieren -----
+# ============================
+
+outputs_m1 = ["Knoten_1", "Knoten_2", "Knoten_3"]
+outputs_m2 = ["Auslenkung"]
+all_outputs = outputs_m1 + outputs_m2
+
+# Feature-Spalten (keine Outputs)
+feat_cols = [c for c in df_all.columns if c not in ([PLAN_COL] + all_outputs)]
+
+# ============================
+# --- Duplikate erkennen -----
+# ============================
+
+df_all["__key__"] = df_all[feat_cols].round(12).astype(str).agg("|".join, axis=1)
+grp = df_all.groupby("__key__").transform("size")
+df_all["__dup"] = grp > 1
+df_all = df_all.loc[~df_all["__dup"] | ~df_all.duplicated("__key__")].reset_index(drop=True)
+
+# ============================
+# --- DUPLEX-Holdout ---------
+# ============================
+
+def build_duplex_holdout(df, n_test=N_TEST, plan_col=PLAN_COL, random_state=0):
+    rng = np.random.default_rng(random_state)
+    X = df[feat_cols].values
+    Xs = RobustScaler().fit_transform(X)
+
+    plans, counts = np.unique(df[plan_col].values, return_counts=True)
+    targets = {p: max(1, int(round(n_test * c/len(df)))) for p, c in zip(plans, counts)}
+
+    eligible = ~df["__dup"].fillna(False)
+    idx_all = np.where(eligible)[0]
+    if len(idx_all) < n_test:
+        raise ValueError("Zu wenige konfliktfreie Punkte für gewünschte Holdout-Größe.")
+
+    start = idx_all[np.argmax(norm(Xs[idx_all], axis=1))]
+    holdout = [start]
+    taken = np.zeros(len(df), dtype=bool)
+    taken[start] = True
+
+    def can_take(i):
+        pid = df.loc[i, plan_col]
+        drawn = sum(df.loc[j, plan_col] == pid for j in holdout)
+        return drawn < targets[pid]
+
+    while len(holdout) < n_test:
+        H = Xs[holdout]
+        dmin = np.min(np.linalg.norm(Xs[:, None, :] - H[None, :, :], axis=2), axis=1)
+        order = np.argsort(-dmin)
+        chosen = None
+        for i in order:
+            if taken[i] or not eligible[i]:
+                continue
+            if can_take(i):
+                chosen = i
+                break
+        if chosen is None:
+            for i in order:
+                if not taken[i] and eligible[i]:
+                    chosen = i
+                    break
+        holdout.append(chosen)
+        taken[chosen] = True
+
+    return np.array(holdout, dtype=int)
+
+# ============================
+# --- Holdout erzeugen -------
+# ============================
+
+idx_holdout = build_duplex_holdout(df_all, n_test=N_TEST, plan_col=PLAN_COL, random_state=42)
+
+# Indices speichern (für Reproduzierbarkeit)
+np.save(os.path.join(OUT_DIR, "Holdout_idx.npy"), idx_holdout)
+
+# Aufteilen
+df_holdout  = df_all.iloc[idx_holdout].copy()
+df_pool_all = df_all.drop(df_all.index[idx_holdout]).copy()
+
+# ============================
+# --- Ergebnisse speichern ---
+# ============================
+
+def save_model_data(model_id, output_cols):
+    df_holdout_model = df_holdout.drop(columns=["__key__", "__dup"], errors="ignore")
+    df_pool_model    = df_pool_all.drop(columns=["__key__", "__dup"], errors="ignore")
+
+    # Holdout
+    df_holdout_model.to_excel(os.path.join(OUT_DIR, f"Holdout_fixed_Modell_{model_id}.xlsx"), index=False)
+    df_holdout_model[feat_cols].to_excel(os.path.join(OUT_DIR, f"Holdout_Modell_{model_id}_Input.xlsx"), index=False)
+    df_holdout_model[output_cols].to_excel(os.path.join(OUT_DIR, f"Holdout_Modell_{model_id}_Output.xlsx"), index=False)
+
+    # Pools
+    for plan_id, dfp in df_pool_model.groupby(PLAN_COL):
+        dfp.to_excel(os.path.join(OUT_DIR, f"Pool_{plan_id}_Modell_{model_id}.xlsx"), index=False)
+        dfp[feat_cols].to_excel(os.path.join(OUT_DIR, f"Pool_{plan_id}_Modell_{model_id}_Input.xlsx"), index=False)
+        dfp[output_cols].to_excel(os.path.join(OUT_DIR, f"Pool_{plan_id}_Modell_{model_id}_Output.xlsx"), index=False)
+
+# Beide Modelle speichern
+save_model_data(1, outputs_m1)
+save_model_data(2, outputs_m2)
+
+print("✅ Holdout_fixed_Modell_1.xlsx und Holdout_fixed_Modell_2.xlsx sind mit denselben Daten erstellt.")
