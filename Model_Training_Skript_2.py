@@ -9,7 +9,6 @@ import atexit
 import glob
 import math
 import os
-import gc
 import signal
 import keras
 import matplotlib.lines as mlines
@@ -24,6 +23,8 @@ from tensorflow.keras import backend as K
 from optuna_integration import TFKerasPruningCallback
 from packaging import version
 from sklearn.metrics import root_mean_squared_error, r2_score
+from sklearn.cluster import KMeans
+
 
 optuna.logging.set_verbosity(optuna.logging.INFO)
 optuna.logging.enable_default_handler()
@@ -192,7 +193,7 @@ def plot_graphs(history, trial_number, y_train, train_predict, y_val, val_predic
     plt.plot(history.history["root_mean_squared_error"], label="Trainingsdaten")
     ax.set_ylim(bottom=0)
     ax.set_xlim(left=0)
-    ax.set_ylabel("RMSE [mm/s]")
+    ax.set_ylabel("RMSE [mm]")
     ax.set_xlabel("Epoche  [-]")
     ax.legend(loc="upper right")
     plt.tight_layout()
@@ -218,10 +219,10 @@ def plot_graphs(history, trial_number, y_train, train_predict, y_val, val_predic
     plt.scatter(y_val, val_predict, label="Validationsdaten")
     ax = plt.gca()
     ax.legend(loc='upper left')
-    plt.xlabel('Reale Fließfronten [mm]', fontsize=15) # Adjust Label
+    plt.xlabel('Reale Auslenkung [mm]', fontsize=15) # Adjust Label
     ax.set_xlim([0, 105]) # Adjust limit for the x-Axis
     ax.set_xticks(np.arange(0, 105, step=10)) # Adjust limit for the steps on the x-Axis
-    plt.ylabel('Vorhergesagte Fließfronten [mm]', fontsize=15) # Adjust label
+    plt.ylabel('Vorhergesagte Auslenkung [mm]', fontsize=15) # Adjust label
     ax.set_ylim([0, 105])  # Adjust limit for the y-Axis
     ax.set_yticks(np.arange(0, 105, step=10)) # Adjust limit for the steps on the y-Axis
     line = mlines.Line2D([0, 1], [0, 1], color="black", alpha=0.8)
@@ -448,7 +449,76 @@ def save_trial_results_with_dynamic_style(trial_number, y_train, train_predict, 
         # Chart einfügen
         worksheet_all_data.insert_chart("J2", chart_all_data)
 
+def borland_instance_reduction(X: pd.DataFrame,
+                               y: pd.Series,
+                               n_keep: int,
+                               seed: int = 0) -> tuple[pd.DataFrame, pd.Series]:
+    """
+    Clusterbasierte Instanzreduktion nach dem Prinzip von Borland (2001):
+    - Clustering im Eingangsraum
+    - pro Cluster wird eine repräsentative reale Instanz behalten (medoidnah)
+    Implementierung: KMeans + Auswahl des dem Clusterzentrum nächsten Punktes.
 
+    X: Eingangsraum (normalisiert)
+    y: Zielgröße (normalisiert)
+    n_keep: gewünschte Anzahl Instanzen nach Reduktion (= Anzahl Cluster)
+    """
+    if n_keep is None:
+        return X, y
+
+    n_keep = int(n_keep)
+    n_total = len(X)
+
+    if n_keep >= n_total or n_keep < 2:
+        return X, y
+
+    X_np = X.to_numpy(dtype=float)
+
+    km = KMeans(
+        n_clusters=n_keep,
+        random_state=seed,
+        n_init=10
+    )
+    labels = km.fit_predict(X_np)
+    centers = km.cluster_centers_
+
+    # Für jedes Cluster: wähle den Punkt mit minimaler Distanz zum Clusterzentrum (medoidnah)
+    selected_idx = []
+    for c in range(n_keep):
+        members = np.where(labels == c)[0]
+        if members.size == 0:
+            continue
+        diffs = X_np[members] - centers[c]
+        d2 = np.einsum("ij,ij->i", diffs, diffs)  # quadratische euklidische Distanz
+        best_local = members[int(np.argmin(d2))]
+        selected_idx.append(best_local)
+
+    # Falls durch (sehr seltene) leere Cluster < n_keep Punkte gewählt wurden: auffüllen mit global „weit entfernten“
+    if len(selected_idx) < n_keep:
+        selected_set = set(selected_idx)
+        remaining = [i for i in range(n_total) if i not in selected_set]
+        # Greedy: wähle Punkte mit größter Distanz zum nächstgelegenen Center (fördert Abdeckung)
+        if remaining:
+            rem_np = X_np[remaining]
+            # Distanz zu nächstem Center
+            d2_min = np.min(((rem_np[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2), axis=1)
+            order = np.argsort(-d2_min)
+            for k in order:
+                selected_idx.append(remaining[int(k)])
+                if len(selected_idx) == n_keep:
+                    break
+
+    selected_idx = np.array(selected_idx[:n_keep], dtype=int)
+    selected_idx.sort()
+
+    X_red = X.iloc[selected_idx].reset_index(drop=True)
+    y_red = y.iloc[selected_idx].reset_index(drop=True)
+
+    return X_red, y_red
+
+
+def compute_n_keep_from_percentage(n_total: int, pct: float) -> int:
+    return max(2, int(round(pct * n_total)))
 
 # Train-Test Erstellung mit Kennard Stone
 def data():
@@ -483,9 +553,9 @@ def data():
     pool_df = pd.read_excel(pool_filename)
 
     holdout_datain = holdout_df.iloc[:, :10]  # Spalten Input
-    holdout_dataout = holdout_df.iloc[:, -3]  # Spalten Output
+    holdout_dataout = holdout_df.iloc[:, -2]  # Spalten Output
     pool_datain = pool_df.iloc[:, :10]  # Spalten Input
-    pool_dataout = pool_df.iloc[:, -3]  # Spalten Output
+    pool_dataout = pool_df.iloc[:, -2]  # Spalten Output
 
     # Normalisieren
     hpoptimize.data_min_x = pool_datain.min().values.astype(float)
@@ -497,6 +567,17 @@ def data():
     pool_df_out = (pool_dataout - hpoptimize.data_min_y) / (hpoptimize.data_max_y - hpoptimize.data_min_y)
     holdout_df_in = (holdout_datain - hpoptimize.data_min_x) / (hpoptimize.data_max_x - hpoptimize.data_min_x)
     holdout_df_out = (holdout_dataout - hpoptimize.data_min_y) / (hpoptimize.data_max_y - hpoptimize.data_min_y)
+
+    # ============================================================
+    # Borland-Instanzreduktion (nur Pool, also Trainingsbasis)
+    # ============================================================
+    if getattr(hpoptimize, "n_keep_pool", None) is not None:
+        pool_df_in, pool_df_out = borland_instance_reduction(
+            pool_df_in,
+            pool_df_out,
+            n_keep=hpoptimize.n_keep_pool,
+            seed=hpoptimize.seed
+        )
 
     # Kennard-Stone Aufteilung
     x_train, x_val, y_train, y_val = train_test_split(
@@ -525,7 +606,7 @@ def save_split_data(x_train, y_train, x_val, y_val, x_test, y_test):
     :param x_test: Test-Eingabedaten
     :param y_test: Test-Zieldaten
     """
-    output_folder = f"Ergebnisse_Teil_2/{hpoptimize.study_name}"
+    output_folder = f"Ergebnisse_Teil_3/{hpoptimize.study_name}"
     os.makedirs(output_folder, exist_ok=True)
     file_path = os.path.join(hpoptimize.paths["data"], f"Split_Daten_{hpoptimize.study_name}.xlsx")
 
@@ -765,7 +846,7 @@ def save_study_results():
     if current_study:
         print("\nSaving study results...")
         study_name = hpoptimize.study_name
-        study_path = f"Ergebnisse_Teil_2/{study_name}"
+        study_path = f"Ergebnisse_Teil_3/{study_name}"
         os.makedirs(study_path, exist_ok=True)  # Ensure the directory exists
         study_file = f"{study_path}/{study_name}.xlsx"
         current_study.trials_dataframe().to_excel(study_file)
@@ -847,7 +928,7 @@ def cleanup_top10(study, trial, base_name):
     print(f"Cleanup done → Top 10 Trials: {[t.number for t in top10]}")
 
 # Main
-def run_hpo(study_name, seed, patience, epochs, n_trials, train_data, test_data):
+def run_hpo(study_name, seed, patience, epochs, n_trials, train_data, test_data, n_keep_pool=None):
     """
     Execute a hyperparameter optimization (HPO) workflow using Optuna. The function initializes
     an Optuna study with specified parameters, performs optimization over a defined number
@@ -870,9 +951,9 @@ def run_hpo(study_name, seed, patience, epochs, n_trials, train_data, test_data)
     """
     global current_study
     initialize(study_name, seed, patience, epochs, n_trials, train_data, test_data)
-
+    hpoptimize.n_keep_pool = n_keep_pool
     # Ergebnisse_Teil_2-Unterordner für bessere Struktur
-    base_dir = f"Ergebnisse_Teil_2/{hpoptimize.study_name}"
+    base_dir = f"Ergebnisse_Teil_3/{hpoptimize.study_name}"
     hpoptimize.paths = {
         "base": base_dir,
         "models": os.path.join(base_dir, "models"),
@@ -922,13 +1003,145 @@ def run_hpo(study_name, seed, patience, epochs, n_trials, train_data, test_data)
 
     save_study_results()
 
+def load_best_value_from_study(study_name: str) -> float:
+    base_dir = f"Ergebnisse_Teil_3/{study_name}"
+    storage = f"sqlite:///{os.path.join(base_dir, study_name + '.sqlite3')}"
+    st = optuna.load_study(study_name=study_name, storage=storage)
+    return float(st.best_value)
+
+
+def staged_reduction_search(base_study_name: str,
+                            seed: int,
+                            patience: int,
+                            epochs: int,
+                            train_data: str,
+                            test_data: str,
+                            target_rmse: float,
+                            perc_stages=(0.95, 0.90, 0.85, 0.80),
+                            trials_screen: int = 100,
+                            trials_confirm: int = 500,
+                            top_k_confirm: int = 2):
+    """
+    Phase A: wenige Trials pro Stufe, um Kandidaten zu finden.
+    Phase B: viele Trials nur für Top-K Stufen.
+    Entscheidung: maximaler Reduktionsgrad, der RMSE <= target_rmse erreicht.
+    """
+    n_total = len(pd.read_excel(train_data))
+
+    # ---------- Phase A: Screening ----------
+    screen_results = []
+    for pct in perc_stages:
+        n_keep = compute_n_keep_from_percentage(n_total, pct)
+        study_name = f"{base_study_name}_SCR_{int(pct*100)}"
+
+        run_hpo(
+            study_name=study_name,
+            seed=seed,
+            patience=patience,
+            epochs=epochs,
+            n_trials=trials_screen,
+            train_data=train_data,
+            test_data=test_data,
+            n_keep_pool=n_keep
+        )
+
+        best = load_best_value_from_study(study_name)
+        screen_results.append({"pct": pct, "n_keep": n_keep, "best_val_rmse": best, "study": study_name})
+        print(f"[SCREEN] {int(pct*100)}% (n_keep={n_keep}): best val_RMSE = {best:.6f}")
+
+    screen_sorted = sorted(screen_results, key=lambda d: d["best_val_rmse"])
+    candidates = screen_sorted[:top_k_confirm]
+
+    # ---------- Phase B: Bestätigung ----------
+    confirm_results = []
+    for c in candidates:
+        pct, n_keep = c["pct"], c["n_keep"]
+        study_name = f"{base_study_name}_CONF_{int(pct*100)}"
+
+        run_hpo(
+            study_name=study_name,
+            seed=seed,
+            patience=patience,
+            epochs=epochs,
+            n_trials=trials_confirm,
+            train_data=train_data,
+            test_data=test_data,
+            n_keep_pool=n_keep
+        )
+
+        best = load_best_value_from_study(study_name)
+        confirm_results.append({"pct": pct, "n_keep": n_keep, "best_val_rmse": best, "study": study_name})
+        print(f"[CONF]  {int(pct*100)}% (n_keep={n_keep}): best val_RMSE = {best:.6f}")
+
+    # ---------- Empfehlung: stärkste Reduktion, die Ziel erfüllt ----------
+    feasible = [r for r in confirm_results if r["best_val_rmse"] <= target_rmse]
+    if feasible:
+        # stärkste Reduktion = kleinste pct bzw. kleinste n_keep
+        recommended = sorted(feasible, key=lambda d: d["n_keep"])[0]
+    else:
+        recommended = None
+
+    return {
+        "n_total": n_total,
+        "target_rmse": target_rmse,
+        "screen": screen_results,
+        "confirm": confirm_results,
+        "recommended": recommended
+    }
+
+def get_target_rmse_from_study_xlsx(study_name: str,
+                                    base_dir: str = "Ergebnisse_Teil_2",
+                                    value_col: str = "value",
+                                    state_col: str = "state") -> float:
+    """
+    Liest Ergebnisse_Teil_2/<study_name>/<study_name>.xlsx (Optuna trials_dataframe)
+    und gibt den besten (kleinsten) value unter COMPLETE zurück.
+    """
+    xlsx_path = os.path.join(base_dir, study_name, f"{study_name}.xlsx")
+    if not os.path.isfile(xlsx_path):
+        raise FileNotFoundError(f"Study-Excel nicht gefunden: {xlsx_path}")
+
+    df = pd.read_excel(xlsx_path)
+
+    if value_col not in df.columns:
+        raise KeyError(f"Spalte '{value_col}' nicht gefunden in {xlsx_path}. Vorhanden: {list(df.columns)}")
+    if state_col not in df.columns:
+        # Fallback: manche Exporte nennen es 'state' oder haben es anders; ohne state können wir nicht filtern
+        raise KeyError(f"Spalte '{state_col}' nicht gefunden in {xlsx_path}. Vorhanden: {list(df.columns)}")
+
+    df_complete = df[df[state_col].astype(str).str.upper().eq("COMPLETE")].copy()
+    df_complete = df_complete[pd.to_numeric(df_complete[value_col], errors="coerce").notna()]
+
+    if df_complete.empty:
+        raise ValueError(f"Keine COMPLETE-Trials mit gültigem '{value_col}' in {xlsx_path} gefunden.")
+
+    # RMSE wird minimiert -> bester Wert ist MIN
+    return float(df_complete[value_col].min())
 
 if __name__ == '__main__':
-    # Set the path to the mplstyle file and adjust it for different dataset
-    holdout_data = r"Getrennte_Daten/Holdout_fixed_Modell_1.xlsx"
-    pool_data = r"Getrennte_Daten/Pool_Halton_Modell_1.xlsx"
-    study_name = "Study_15_10_2025_Halton_Modell_1.2_KS_Holdout_seed_999"
+    holdout_data = r"Getrennte_Daten/Holdout_fixed_Modell_2.xlsx"
+    pool_data = r"Getrennte_Daten/Pool_LHS_Modell_2.xlsx"
 
-    # Adjust the parameters and the Study name
-    run_hpo(study_name=study_name, seed=999, patience=100, n_trials=500, epochs=1000,
-            train_data=pool_data, test_data=holdout_data)
+    base_name = "Study_15_10_2025_LHS_Modell_2_LHS_KS_CBIR_Holdout_seed_42"
+
+    base_name_rmse = "Study_15_10_2025_LHS_Modell_2_KS_Holdout_seed_42"
+    target_rmse = get_target_rmse_from_study_xlsx(base_name_rmse)
+    print("Target RMSE (Baseline best COMPLETE):", target_rmse)
+
+    summary = staged_reduction_search(
+        base_study_name=base_name,
+        seed=42,
+        patience=100,
+        epochs=1000,
+        train_data=pool_data,
+        test_data=holdout_data,
+        target_rmse=target_rmse,
+        perc_stages=(0.95, 0.90, 0.85, 0.80),
+        trials_screen=100,
+        trials_confirm=500,
+        top_k_confirm=1
+    )
+
+    print("\n=== Zusammenfassung ===")
+    print("Target RMSE:", summary["target_rmse"])
+    print("Recommended:", summary["recommended"])

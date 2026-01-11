@@ -18,12 +18,12 @@ import optuna
 import pandas as pd
 import tensorflow as tf
 import logging
+from kennard_stone import train_test_split
 from tensorflow.keras import backend as K
 from optuna_integration import TFKerasPruningCallback
 from packaging import version
 from sklearn.metrics import root_mean_squared_error, r2_score
-from sklearn.preprocessing import RobustScaler
-from numpy.linalg import norm
+from sklearn.neighbors import NearestNeighbors
 
 optuna.logging.set_verbosity(optuna.logging.INFO)
 optuna.logging.enable_default_handler()
@@ -192,7 +192,7 @@ def plot_graphs(history, trial_number, y_train, train_predict, y_val, val_predic
     plt.plot(history.history["root_mean_squared_error"], label="Trainingsdaten")
     ax.set_ylim(bottom=0)
     ax.set_xlim(left=0)
-    ax.set_ylabel("RMSE [mm/s]")
+    ax.set_ylabel("RMSE [mm]")
     ax.set_xlabel("Epoche  [-]")
     ax.legend(loc="upper right")
     plt.tight_layout()
@@ -218,10 +218,10 @@ def plot_graphs(history, trial_number, y_train, train_predict, y_val, val_predic
     plt.scatter(y_val, val_predict, label="Validationsdaten")
     ax = plt.gca()
     ax.legend(loc='upper left')
-    plt.xlabel('Reale Fließfronten [mm]', fontsize=15) # Adjust Label
+    plt.xlabel('Reale Auslenkung [mm]', fontsize=15) # Adjust Label
     ax.set_xlim([0, 105]) # Adjust limit for the x-Axis
     ax.set_xticks(np.arange(0, 105, step=10)) # Adjust limit for the steps on the x-Axis
-    plt.ylabel('Vorhergesagte Fließfronten [mm]', fontsize=15) # Adjust label
+    plt.ylabel('Vorhergesagte Auslenkung [mm]', fontsize=15) # Adjust label
     ax.set_ylim([0, 105])  # Adjust limit for the y-Axis
     ax.set_yticks(np.arange(0, 105, step=10)) # Adjust limit for the steps on the y-Axis
     line = mlines.Line2D([0, 1], [0, 1], color="black", alpha=0.8)
@@ -448,41 +448,59 @@ def save_trial_results_with_dynamic_style(trial_number, y_train, train_predict, 
         # Chart einfügen
         worksheet_all_data.insert_chart("J2", chart_all_data)
 
-def duplex_split_indices(X, val_fraction=0.111111):
+def local_regression_mix(
+    X: pd.DataFrame,
+    y: pd.Series,
+    n_augmented: int,
+    k_neighbors: int = 5,
+    seed: int = 0
+    ) -> tuple[pd.DataFrame, pd.Series]:
     """
-    Wählt per DUPLEX-/MaxMin-Strategie Indizes für das Validierungsset aus.
-    Der Rest der Daten kann dann als Trainingsset verwendet werden.
-
-    :param X: Eingabedaten (DataFrame oder ndarray)
-    :param val_fraction: Anteil der Daten, die als Validation verwendet werden sollen
-    :return: ndarray mit Indizes des Validierungssets
+    Lokale mischbasierte Datenerweiterung für Regression (vereinfacht).
+    - NUR Trainingsdaten!
+    - Auswahl lokaler Nachbarn im X-Raum
+    - lineare Interpolation von (X, y)
     """
-    X = np.asarray(X)
-    n_samples = X.shape[0]
-    n_val = int(round(n_samples * val_fraction))
-    if n_val < 1:
-        raise ValueError("val_fraction zu klein, weniger als 1 Punkt.")
+    if n_augmented is None or int(n_augmented) <= 0:
+        return X, y
 
-    # Robust skalieren
-    Xs = RobustScaler().fit_transform(X)
+    n_augmented = int(n_augmented)
+    k_neighbors = int(k_neighbors)
 
-    # 1. Startpunkt: größter Norm-Abstand vom Ursprung
-    start = np.argmax(norm(Xs, axis=1))
-    val_idx = [int(start)]
-    taken = np.zeros(n_samples, dtype=bool)
-    taken[start] = True
+    rng = np.random.default_rng(seed)
 
-    # 2. Iteratives MaxMin-Picking
-    while len(val_idx) < n_val:
-        H = Xs[val_idx]  # bereits gewählte Punkte
-        dmin = np.min(norm(Xs[:, None, :] - H[None, :, :], axis=2), axis=1)
-        dmin[taken] = -np.inf  # bereits genommene Punkte blockieren
+    X_np = X.to_numpy(dtype=float)
+    y_np = y.to_numpy(dtype=float).reshape(-1, 1)
+    n_samples = X_np.shape[0]
 
-        next_idx = int(np.argmax(dmin))
-        val_idx.append(next_idx)
-        taken[next_idx] = True
+    # Wenn zu wenig Punkte: keine Augmentation
+    if n_samples < 2:
+        return X, y
 
-    return np.array(val_idx, dtype=int)
+    # k begrenzen, damit es immer funktioniert
+    k_neighbors = max(1, min(k_neighbors, n_samples - 1))
+
+    nn = NearestNeighbors(n_neighbors=k_neighbors + 1)
+    nn.fit(X_np)
+    neighbors = nn.kneighbors(X_np, return_distance=False)
+
+    X_new = np.empty((n_augmented, X_np.shape[1]), dtype=float)
+    y_new = np.empty((n_augmented,), dtype=float)
+
+    for t in range(n_augmented):
+        i = rng.integers(0, n_samples)
+        neigh_idx = neighbors[i][1:]          # ohne sich selbst
+        j = rng.choice(neigh_idx)
+
+        lam = rng.uniform(0.0, 1.0)
+
+        X_new[t] = lam * X_np[i] + (1.0 - lam) * X_np[j]
+        y_new[t] = float(lam * y_np[i] + (1.0 - lam) * y_np[j])
+
+    X_aug = pd.concat([X, pd.DataFrame(X_new, columns=X.columns)], ignore_index=True)
+    y_aug = pd.concat([y, pd.Series(y_new, name=y.name)], ignore_index=True)
+
+    return X_aug, y_aug
 
 # Train-Test Erstellung mit Kennard Stone
 def data():
@@ -532,20 +550,31 @@ def data():
     holdout_df_in = (holdout_datain - hpoptimize.data_min_x) / (hpoptimize.data_max_x - hpoptimize.data_min_x)
     holdout_df_out = (holdout_dataout - hpoptimize.data_min_y) / (hpoptimize.data_max_y - hpoptimize.data_min_y)
 
-    # DUPLEX-Aufteilung: Validation-Indices auswählen
-    val_idx = (duplex_split_indices
-               (pool_df_in,
-                val_fraction=0.111111))
-
-    mask = np.ones(len(pool_df_in), dtype=bool)
-    mask[val_idx] = False
-
-    x_val = pool_df_in.iloc[val_idx].reset_index(drop=True)
-    y_val = pool_df_out.iloc[val_idx].reset_index(drop=True)
-    x_train = pool_df_in.iloc[mask].reset_index(drop=True)
-    y_train = pool_df_out.iloc[mask].reset_index(drop=True)
-
+    # Kennard-Stone Aufteilung
+    x_train, x_val, y_train, y_val = train_test_split(
+        pool_df_in,
+        pool_df_out,
+        test_size=0.111111)
     x_test, y_test = holdout_df_in, holdout_df_out
+
+    # ============================================================
+    # RegMix / lokale mischbasierte Datenerweiterung (NUR Training)
+    # ============================================================
+    aug = getattr(hpoptimize, "n_augmented", 0)
+
+    if isinstance(aug, float) and 0.0 < aug < 1.0:
+        n_aug = int(round(aug * len(x_train)))
+    else:
+        n_aug = int(aug)
+
+    if n_aug > 0:
+        x_train, y_train = local_regression_mix(
+            X=x_train,
+            y=y_train,
+            n_augmented=n_aug,
+            k_neighbors=int(getattr(hpoptimize, "k_neighbors", 5)),
+            seed=int(hpoptimize.seed)
+        )
 
     return x_train, y_train, x_val, y_val, x_test, y_test
 
@@ -567,7 +596,7 @@ def save_split_data(x_train, y_train, x_val, y_val, x_test, y_test):
     :param x_test: Test-Eingabedaten
     :param y_test: Test-Zieldaten
     """
-    output_folder = f"Ergebnisse_Teil_2/{hpoptimize.study_name}"
+    output_folder = f"Ergebnisse_Teil_3/{hpoptimize.study_name}"
     os.makedirs(output_folder, exist_ok=True)
     file_path = os.path.join(hpoptimize.paths["data"], f"Split_Daten_{hpoptimize.study_name}.xlsx")
 
@@ -807,7 +836,7 @@ def save_study_results():
     if current_study:
         print("\nSaving study results...")
         study_name = hpoptimize.study_name
-        study_path = f"Ergebnisse_Teil_2/{study_name}"
+        study_path = f"Ergebnisse_Teil_3/{study_name}"
         os.makedirs(study_path, exist_ok=True)  # Ensure the directory exists
         study_file = f"{study_path}/{study_name}.xlsx"
         current_study.trials_dataframe().to_excel(study_file)
@@ -889,7 +918,7 @@ def cleanup_top10(study, trial, base_name):
     print(f"Cleanup done → Top 10 Trials: {[t.number for t in top10]}")
 
 # Main
-def run_hpo(study_name, seed, patience, epochs, n_trials, train_data, test_data):
+def run_hpo(study_name, seed, patience, epochs, n_trials, train_data, test_data, n_augmented=0, k_neighbors=5):
     """
     Execute a hyperparameter optimization (HPO) workflow using Optuna. The function initializes
     an Optuna study with specified parameters, performs optimization over a defined number
@@ -912,9 +941,11 @@ def run_hpo(study_name, seed, patience, epochs, n_trials, train_data, test_data)
     """
     global current_study
     initialize(study_name, seed, patience, epochs, n_trials, train_data, test_data)
+    hpoptimize.n_augmented = n_augmented  # kann float (ratio) oder int (absolute) sein
+    hpoptimize.k_neighbors = int(k_neighbors)
 
     # Ergebnisse_Teil_2-Unterordner für bessere Struktur
-    base_dir = f"Ergebnisse_Teil_2/{hpoptimize.study_name}"
+    base_dir = f"Ergebnisse_Teil_3/{hpoptimize.study_name}"
     hpoptimize.paths = {
         "base": base_dir,
         "models": os.path.join(base_dir, "models"),
@@ -965,12 +996,52 @@ def run_hpo(study_name, seed, patience, epochs, n_trials, train_data, test_data)
     save_study_results()
 
 
-if __name__ == '__main__':
-    # Set the path to the mplstyle file and adjust it for different dataset
-    holdout_data = r"Getrennte_Daten/Holdout_fixed_Modell_1.xlsx"
-    pool_data = r"Getrennte_Daten/Pool_Halton_Modell_1.xlsx"
-    study_name = "Study_15_10_2025_Halton_Modell_1.3_DUPLEX_Holdout_seed_0"
+def get_target_rmse_from_study_xlsx(study_name: str,
+                                    base_dir: str = "Ergebnisse_Teil_2",
+                                    value_col: str = "value",
+                                    state_col: str = "state") -> float:
+    """
+    Liest Ergebnisse_Teil_2/<study_name>/<study_name>.xlsx (Optuna trials_dataframe)
+    und gibt den besten (kleinsten) value unter COMPLETE zurück.
+    """
+    xlsx_path = os.path.join(base_dir, study_name, f"{study_name}.xlsx")
+    if not os.path.isfile(xlsx_path):
+        raise FileNotFoundError(f"Study-Excel nicht gefunden: {xlsx_path}")
 
-    # Adjust the parameters and the Study name
-    run_hpo(study_name=study_name, seed=0, patience=100, n_trials=500, epochs=1000,
-            train_data=pool_data, test_data=holdout_data)
+    df = pd.read_excel(xlsx_path)
+
+    if value_col not in df.columns:
+        raise KeyError(f"Spalte '{value_col}' nicht gefunden in {xlsx_path}. Vorhanden: {list(df.columns)}")
+    if state_col not in df.columns:
+        # Fallback: manche Exporte nennen es 'state' oder haben es anders; ohne state können wir nicht filtern
+        raise KeyError(f"Spalte '{state_col}' nicht gefunden in {xlsx_path}. Vorhanden: {list(df.columns)}")
+
+    df_complete = df[df[state_col].astype(str).str.upper().eq("COMPLETE")].copy()
+    df_complete = df_complete[pd.to_numeric(df_complete[value_col], errors="coerce").notna()]
+
+    if df_complete.empty:
+        raise ValueError(f"Keine COMPLETE-Trials mit gültigem '{value_col}' in {xlsx_path} gefunden.")
+
+    # RMSE wird minimiert -> bester Wert ist MIN
+    return float(df_complete[value_col].min())
+
+if __name__ == '__main__':
+    holdout_data = r"Getrennte_Daten/Holdout_fixed_Modell_2.xlsx"
+    pool_data    = r"Getrennte_Daten/Pool_LHS_Modell_2.xlsx"
+
+    study_name = "Study_15_10_2025_LHS_Modell_2_LHS_KS_RegMix_Holdout_seed_999"
+
+    n_augmented = 0.5   # 0.5 = +50% Trainingspunkte nach KS-Split
+    k_neighbors = 5
+
+    run_hpo(
+        study_name=study_name,
+        seed=999,
+        patience=100,
+        epochs=1000,
+        n_trials=500,
+        train_data=pool_data,
+        test_data=holdout_data,
+        n_augmented=n_augmented,
+        k_neighbors=k_neighbors
+    )

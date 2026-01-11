@@ -221,6 +221,20 @@ def auswertung_modell(n: int):
 
     subfolder = f"Modell_{n}"
 
+    def aggregate_per_plan(values_dict):
+        plans, means, stds = [], [], []
+        for plan in ["Halton", "LHS", "Sobol", "Taguchi"]:
+            if plan not in values_dict:
+                continue
+            vals = np.array(values_dict[plan], dtype=float)
+            vals = vals[~np.isnan(vals)]
+            if len(vals) == 0:
+                continue
+            plans.append(plan)
+            means.append(vals.mean())
+            stds.append(vals.std(ddof=1) if len(vals) > 1 else 0.0)
+        return plans, means, stds
+
     # ================================
     # Plot 1) RMSE Train / Val / Test(global) + Test(eigene Daten)
     # ================================
@@ -239,6 +253,7 @@ def auswertung_modell(n: int):
     ax.scatter(study_names, rmse_test_own, marker="o",
                label="Test eigene Daten", zorder=1, color="#0098AD")
 
+    ax.set_ylim(top=20)
     ax.set_ylabel("RMSE")
     ax.legend()
     ax.set_title(f"RMSE aller besten Modelle (Modell {n}.*)\nGlobales Testset vs. eigene Testdaten")
@@ -273,9 +288,107 @@ def auswertung_modell(n: int):
     plt.tight_layout()
     save_plot(fig, f"R2_all_Modell_{n}_kombiniert.png", subfolder)
 
+    # ================================
+    # Plot 3) RMSE (Train/Val/Test global/Test eigene) pro Versuchsplan – gruppierte Balken
+    # ================================
+    plan_to_rmse_train = {}
+    plan_to_rmse_val = {}
+    plan_to_rmse_glob = {}
+    plan_to_rmse_own = {}
+
+    for plan, rm_tr, rm_v, rm_g, rm_o in zip(method_names, rmse_train, rmse_val, rmse_test_global, rmse_test_own):
+        if plan not in COLOR_MAP:
+            continue
+        if not pd.isna(rm_tr):
+            plan_to_rmse_train.setdefault(plan, []).append(rm_tr)
+        if not pd.isna(rm_v):
+            plan_to_rmse_val.setdefault(plan, []).append(rm_v)
+        if not pd.isna(rm_g):
+            plan_to_rmse_glob.setdefault(plan, []).append(rm_g)
+        if not pd.isna(rm_o):
+            plan_to_rmse_own.setdefault(plan, []).append(rm_o)
+
+    plans, mean_tr, std_tr = aggregate_per_plan(plan_to_rmse_train)
+    _, mean_v, std_v = aggregate_per_plan(plan_to_rmse_val)
+    _, mean_g, std_g = aggregate_per_plan(plan_to_rmse_glob)
+    _, mean_o, std_o = aggregate_per_plan(plan_to_rmse_own)
+
+    if plans:
+        x = np.arange(len(plans))
+        width = 0.20
+        fig, ax = plt.subplots(figsize=(9, 5))
+
+        ax.bar(x - 1.5 * width, mean_tr, width, yerr=std_tr, capsize=4,
+               label="Train", color="#95BB20", edgecolor="black")
+        ax.bar(x - 0.5 * width, mean_v, width, yerr=std_v, capsize=4,
+               label="Validation", color="#00354E", edgecolor="black")
+        ax.bar(x + 0.5 * width, mean_g, width, yerr=std_g, capsize=4,
+               label="Test global", color="#717E86", edgecolor="black")
+        ax.bar(x + 1.5 * width, mean_o, width, yerr=std_o, capsize=4,
+               label="Test eigene Daten", color="#0098AD", edgecolor="black")
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(plans)
+        ax.set_ylabel("RMSE")
+        ax.legend(loc="upper right")
+        ax.set_title(f"RMSE (Train/Val/Test global/Test eigene) pro Versuchsplan (Modell {n}.*)")
+        ax.grid(axis="y", linestyle="--", alpha=0.6)
+        ax.set_axisbelow(True)
+        plt.tight_layout()
+        save_plot(fig, f"RMSE_TrainValTest_all_Modell_{n}_by_plan_kombiniert.png", subfolder)
+
+    # ================================
+    # Plot 4) R² (Train/Val/Test global/Test eigene) pro Versuchsplan – gruppierte Balken
+    # ================================
+    plan_to_r2_train = {}
+    plan_to_r2_val = {}
+    plan_to_r2_glob = {}
+    plan_to_r2_own = {}
+
+    for plan, r2_tr, r2_v, r2_g, r2_o in zip(method_names, r2_train, r2_val, r2_test_global, r2_test_own):
+        if plan not in COLOR_MAP:
+            continue
+        if not pd.isna(r2_tr):
+            plan_to_r2_train.setdefault(plan, []).append(r2_tr)
+        if not pd.isna(r2_v):
+            plan_to_r2_val.setdefault(plan, []).append(r2_v)
+        if not pd.isna(r2_g):
+            plan_to_r2_glob.setdefault(plan, []).append(r2_g)
+        if not pd.isna(r2_o):
+            plan_to_r2_own.setdefault(plan, []).append(r2_o)
+
+    plans, mean_tr, std_tr = aggregate_per_plan(plan_to_r2_train)
+    _, mean_v, std_v = aggregate_per_plan(plan_to_r2_val)
+    _, mean_g, std_g = aggregate_per_plan(plan_to_r2_glob)
+    _, mean_o, std_o = aggregate_per_plan(plan_to_r2_own)
+
+    if plans:
+        x = np.arange(len(plans))
+        width = 0.20
+        fig, ax = plt.subplots(figsize=(9, 5))
+
+        ax.bar(x - 1.5 * width, mean_tr, width, yerr=std_tr, capsize=4,
+               label="Train", color="#95BB20", edgecolor="black")
+        ax.bar(x - 0.5 * width, mean_v, width, yerr=std_v, capsize=4,
+               label="Validation", color="#00354E", edgecolor="black")
+        ax.bar(x + 0.5 * width, mean_g, width, yerr=std_g, capsize=4,
+               label="Test global", color="#717E86", edgecolor="black")
+        ax.bar(x + 1.5 * width, mean_o, width, yerr=std_o, capsize=4,
+               label="Test eigene Daten", color="#0098AD", edgecolor="black")
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(plans)
+        ax.set_ylabel("R²")
+        ax.legend()
+        ax.set_title(f"R² (Train/Val/Test global/Test eigene) pro Versuchsplan (Modell {n}.*)")
+        ax.grid(axis="y", linestyle="--", alpha=0.6)
+        ax.set_axisbelow(True)
+        plt.tight_layout()
+        save_plot(fig, f"R2_TrainValTest_all_Modell_{n}_by_plan_kombiniert.png", subfolder)
+
     print(f"Plots für Modell {n} gespeichert unter: {os.path.join(output_dir, subfolder)}")
 
 
 if __name__ == "__main__":
-    auswertung_modell(1)
+    #auswertung_modell(1)
     auswertung_modell(2)

@@ -5,15 +5,28 @@ import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
 import plotly.express as px
 
-
 # =====================================================================
 # 1. Globale Konfiguration
 # =====================================================================
 
+# Basisordner mit deinen Study-Unterordnern
 ROOT = Path("Ergebnisse_Teil_1")
-MODEL = 1
-MODEL_LABEL_FOR_PLOT = "1.1"   # z.B. "1.3" oder None für alle 1.x
-METRIC = "rmse"               # "rmse" oder "r2"
+
+# Welches Hauptmodell auswerten? 1 -> Modell 1.x (1.1, 1.2, 1.3), 2 -> Modell 2
+MODEL = 2
+
+# Welches Submodell soll geplottet werden?
+# - "1.1", "1.2", "1.3"  -> nur dieses Submodell
+# - "2"                  -> Modell 2
+# - None                 -> alle 1.x gemeinsam (nur sinnvoll bei MODEL = 1)
+MODEL_LABEL_FOR_PLOT = None   # z.B. "1.3" oder None für alle 1.x
+
+# Welche Metrik soll für die Farbe verwendet werden?
+# "rmse" -> kleiner ist besser
+# "r2"   -> größer ist besser
+METRIC = "rmse"
+
+# Wie viele der besten Trials pro (Versuchsplan, Seed) im Plot anzeigen?
 BEST_PER_PLAN_SEED = 10
 
 # =====================================================================
@@ -21,6 +34,14 @@ BEST_PER_PLAN_SEED = 10
 # =====================================================================
 
 def parse_study_name(study_name: str, model: int):
+    """
+    Analysiert den Ordner- bzw. Dateinamen und extrahiert:
+    - Versuchsplan (Halton, LHS, Sobol, Taguchi)
+    - Modell-Label (z.B. '1.1' oder '2')
+    - Submodell (z.B. '1' für 1.1, 2 für 1.2, ...)
+    - Split-Methode (z.B. 'KS_Holdout')
+    - Seed (int)
+    """
     m_plan = re.search(r"(Halton|LHS|Sobol|Taguchi)", study_name, re.I)
     plan = m_plan.group(1) if m_plan else None
 
@@ -40,19 +61,28 @@ def parse_study_name(study_name: str, model: int):
 
     return plan, modell_label, sub, split, seed
 
-
 def collect_all_trials_for_model(model: int, metric: str) -> pd.DataFrame:
+    """
+    Lädt für MODEL (1 oder 2) alle COMPLETE-Trials aus allen Study-Ordnern
+    unter ROOT und hängt Plan/Modell/Split/Seed als Spalten an.
+
+    metric:
+      "rmse" -> erwartet user_attrs_val_rmse oder nutzt value als RMSE
+      "r2"   -> erwartet user_attrs_val_r2   oder nutzt value als R²
+    """
     rows = []
 
     for study_dir in sorted(ROOT.iterdir()):
         if not study_dir.is_dir():
             continue
 
+        # nur passende Modellordner berücksichtigen
         if model == 1 and "Modell_1" not in study_dir.name:
             continue
         if model == 2 and "Modell_2" not in study_dir.name:
             continue
 
+        # Study-Excel im Ordner suchen
         study_file = next((f for f in study_dir.glob("*.xlsx") if "Study" in f.name), None)
         if study_file is None:
             continue
@@ -61,10 +91,12 @@ def collect_all_trials_for_model(model: int, metric: str) -> pd.DataFrame:
 
         df = pd.read_excel(study_file)
 
+        # nur COMPLETE-Trials
         df = df[df["state"] == "COMPLETE"].copy()
         if df.empty:
             continue
 
+        # Metrik-Spalte definieren
         if metric == "rmse":
             if "user_attrs_val_rmse" in df.columns:
                 df["metric_val"] = df["user_attrs_val_rmse"]
@@ -78,8 +110,9 @@ def collect_all_trials_for_model(model: int, metric: str) -> pd.DataFrame:
         else:
             raise ValueError("METRIC muss 'rmse' oder 'r2' sein.")
 
+        # Meta-Infos anhängen
         df["Versuchsplan"] = plan
-        df["Modell"] = modell_label
+        df["Modell"] = modell_label      # wichtig für Model-Type-Achse
         df["Split_Methode"] = split
         df["Seed"] = seed
 
@@ -91,16 +124,6 @@ def collect_all_trials_for_model(model: int, metric: str) -> pd.DataFrame:
     df_all = pd.concat(rows, ignore_index=True)
     return df_all
 
-
-def frange(start, stop, step):
-    vals = []
-    v = start
-    while v <= stop + 1e-9:
-        vals.append(v)
-        v += step
-    return vals
-
-
 # =====================================================================
 # 3. Parallel-Coordinates-Plot
 # =====================================================================
@@ -110,37 +133,32 @@ def make_parallel_coordinates(df_all: pd.DataFrame,
                               metric: str,
                               best_per_plan_seed: int = 50):
 
-    mappings = {}
-
-    # 1) Filter
+    # 1) Filter: nur bestimmtes Submodell oder alle?
     if model_label_for_plot is not None:
-        # Wichtig: MODEL_LABEL_FOR_PLOT muss ein String sein, z.B. "1.1"
+        # z.B. nur "1.3"
         df = df_all[df_all["Modell"] == model_label_for_plot].copy()
         if df.empty:
             raise ValueError(f"Keine Daten für Modell {model_label_for_plot} gefunden.")
         title_suffix = f"Modell {model_label_for_plot}"
     else:
+        # alle 1.x gemeinsam
         df = df_all.copy()
-        if df["Modell"].nunique() == 1:
-            title_suffix = f"Modell {df['Modell'].iloc[0]}"
-        else:
-            title_suffix = "Modell 1.x (alle Submodelle)"
+        title_suffix = "Modell 1.x (alle Submodelle)"
 
-    # 2) beste N pro (Plan, Seed, ggf. Modell)
-    ascending = (metric == "rmse")
-
-    group_cols = ["Versuchsplan", "Seed"]
-    # Modell nur in die Gruppierung nehmen, wenn wir mehrere Modelle gleichzeitig betrachten
-    if MODEL == 1 and model_label_for_plot is None:
-        group_cols.append("Modell")
+    # 2) pro (Versuchsplan, Seed) die besten N Trials auswählen
+    if metric == "rmse":
+        ascending = True   # kleiner ist besser
+    else:  # "r2"
+        ascending = False  # größer ist besser
 
     df = (
         df.sort_values("metric_val", ascending=ascending)
-          .groupby(group_cols, as_index=False)
+          .groupby(["Versuchsplan", "Seed"], as_index=False)
           .head(best_per_plan_seed)
           .reset_index(drop=True)
     )
 
+    # 3) numerische Hyperparameter
     base_num_cols = [
         "params_Batch_Size",
         "params_Learning_Rate",
@@ -151,28 +169,24 @@ def make_parallel_coordinates(df_all: pd.DataFrame,
         "params_n_units_l2",
     ]
 
-    # --------------------------------------------------------
-    # Sollen wir eine Model-Achse verwenden?
-    # -> nur bei MODEL == 1 UND wenn mehrere Modelle gleichzeitig geplottet werden
-    # --------------------------------------------------------
-    use_model_axis = (MODEL == 1 and model_label_for_plot is None and df["Modell"].nunique() > 1)
-
-    if use_model_axis:
-        models = sorted(df["Modell"].unique())
-        if len(models) > 1:
-            model_mapping = {m: (i / (len(models) - 1)) for i, m in enumerate(models)}
-        else:
-            model_mapping = {models[0]: 0.5}
-
-        mappings["Modell"] = model_mapping
-        df["ModelType"] = df["Modell"].map(model_mapping)
-        num_cols = ["ModelType"] + base_num_cols
+    # 4) Model Type explizit kodieren: 1.1 -> 0.0, 1.2 -> 0.5, 1.3 -> 1.0
+    models = sorted(df["Modell"].unique())  # z.B. ['1.1', '1.2', '1.3']
+    if len(models) > 1:
+        model_mapping = {
+            m: (i / (len(models) - 1)) for i, m in enumerate(models)
+        }  # bei 3 Modellen: 0.0, 0.5, 1.0
     else:
-        # kein ModelType, keine Model-Achse
-        model_mapping = {}
-        models = []
-        num_cols = base_num_cols
+        # falls nur ein Modell vorhanden ist
+        model_mapping = {models[0]: 0.5}
 
+    mappings = {
+        "Modell": model_mapping
+    }
+
+    df["ModelType"] = df["Modell"].map(model_mapping)
+    num_cols = ["ModelType"] + base_num_cols  # ModelType als erste numerische Achse
+
+    # 5) weitere kategoriale Spalten
     cat_cols = [
         "Versuchsplan",
         "params_act_func_l0",
@@ -186,7 +200,7 @@ def make_parallel_coordinates(df_all: pd.DataFrame,
 
     df_plot = df[num_cols + cat_cols + ["metric_val"]].copy()
 
-    # Kategorie-Mappings befüllen
+    # 6) Kategoriale Variablen → Codes + Mapping speichern
     for col in cat_cols:
         cat = df_plot[col].astype("category")
         df_plot[col + "_code"] = cat.cat.codes
@@ -194,6 +208,7 @@ def make_parallel_coordinates(df_all: pd.DataFrame,
 
     cols_for_plot = num_cols + [c + "_code" for c in cat_cols]
 
+    # 7) Skalieren auf [0, 1]
     scaler = MinMaxScaler()
     df_scaled = pd.DataFrame(
         scaler.fit_transform(df_plot[cols_for_plot]),
@@ -201,6 +216,7 @@ def make_parallel_coordinates(df_all: pd.DataFrame,
     )
     df_scaled["metric_val"] = df_plot["metric_val"].values
 
+    # 8) Schöne Achsennamen
     rename_map = {
         "params_Batch_Size": "Batch Size",
         "params_Learning_Rate": "Learning Rate",
@@ -213,11 +229,12 @@ def make_parallel_coordinates(df_all: pd.DataFrame,
         "params_act_func_l1_code": "Activation L1",
         "params_act_func_l2_code": "Activation L2",
         "Versuchsplan_code": "Versuchsplan",
-        "ModelType": "Model",
+        "ModelType": "Model"
     }
 
     df_scaled = df_scaled.rename(columns=rename_map)
 
+    # gewünschte Reihenfolge der Achsen
     dimensions = [
         "Batch Size",
         "Learning Rate",
@@ -230,29 +247,25 @@ def make_parallel_coordinates(df_all: pd.DataFrame,
         "Activation L1",
         "Activation L2",
         "Versuchsplan",
+        "Model"
     ]
-    if use_model_axis:
-        dimensions.append("Model")
 
-    # 9) Farbskala + Beschriftung + Colorbar-Ticks
+    # 9) Farbskala + Beschriftung
     min_v = df_scaled["metric_val"].min()
     max_v = df_scaled["metric_val"].max()
 
     if metric == "rmse":
-        colorscale = "Teal"
+        colorscale = "Teal"      # farbenblind-sicher
         colorbar_title = "RMSE"
-        step = 0.5 if max_v < 5 else 5.0
+        ticktext = [f"{min_v:.3f}  (gut)", f"{max_v:.3f}  (schlecht)"]
     else:
-        colorscale = "Teal_r"
+        colorscale = "Teal_r"    # invertiert, damit hohes R² dunkel ist
         colorbar_title = "R²"
-        step = 0.1
+        ticktext = [f"{min_v:.3f}  (schlecht)", f"{max_v:.3f}  (gut)"]
 
-    start = (min_v // step) * step
-    base_ticks = [round(v, 2) for v in frange(start, max_v, step) if v >= min_v - 1e-9]
+    tickvals = [min_v, max_v]
 
-    all_ticks = sorted(set(base_ticks + [min_v, max_v]))
-    ticktext = [f"{v:.2f}" for v in all_ticks]
-
+    # 10) Plot erstellen
     fig = px.parallel_coordinates(
         df_scaled,
         dimensions=dimensions,
@@ -261,30 +274,19 @@ def make_parallel_coordinates(df_all: pd.DataFrame,
         title=f"Parallel Coordinates – {title_suffix}",
     )
 
-    idx_min = all_ticks.index(min_v)
-    idx_max = all_ticks.index(max_v)
-
-    if metric == "rmse":
-        ticktext[idx_min] = f"{min_v:.2f}  (gut)"
-        ticktext[idx_max] = f"{max_v:.2f}  (schlecht)"
-    else:
-        ticktext[idx_min] = f"{min_v:.2f}  (schlecht)"
-        ticktext[idx_max] = f"{max_v:.2f}  (gut)"
-
     fig.update_coloraxes(
         colorbar_title=colorbar_title,
         colorbar=dict(
-            tickvals=all_ticks,
+            tickvals=tickvals,
             ticktext=ticktext,
-            ticks="outside",
         )
     )
 
-    # Model-Achse nur beschriften, wenn sie überhaupt existiert
-    if use_model_axis and model_mapping:
+    # 11) Ticks für Model-Type-Achse sauber setzen (0 / 0.5 / 1 → 1.1 / 1.2 / 1.3)
+    if len(models) > 1:
         model_vals = [model_mapping[m] for m in models]
         for dim in fig.data[0]["dimensions"]:
-            if dim["label"] == "Model":
+            if dim["label"] == "Model Type":
                 dim["tickvals"] = model_vals
                 dim["ticktext"] = models
                 break
@@ -292,7 +294,6 @@ def make_parallel_coordinates(df_all: pd.DataFrame,
     fig.show()
 
     return fig, df_scaled, mappings
-
 
 # =====================================================================
 # 4. Main
@@ -312,16 +313,19 @@ if __name__ == "__main__":
         best_per_plan_seed=BEST_PER_PLAN_SEED,
     )
 
+    # Zielordner
     out_dir = Path("Ergebnisse_ParallelCoordinates")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     label = MODEL_LABEL_FOR_PLOT if MODEL_LABEL_FOR_PLOT is not None else "1x_all"
     metric_label = METRIC
 
-    fig.write_html(out_dir / f"ParallelPlot_Modell_{label}_{metric_label}.html")
-    fig.write_image(out_dir / f"ParallelPlot_Modell_{label}_{metric_label}.png", scale=2)
+    # Plot speichern
+    fig.write_html(out_dir / f"ParallelPlot_Modell_{label}_{metric_label}_overall_best.html")
+    fig.write_image(out_dir / f"ParallelPlot_Modell_{label}_{metric_label}_overall_best.png", scale=2)
 
-    mappings_path = out_dir / f"Mappings_Modell_{label}_{metric_label}.txt"
+    # Mappings als TXT speichern
+    mappings_path = out_dir / f"Mappings_Modell_{label}_{metric_label}_overall_best.txt"
     with open(mappings_path, "w") as f:
         for col, mapping in mappings.items():
             f.write(f"{col}:\n")

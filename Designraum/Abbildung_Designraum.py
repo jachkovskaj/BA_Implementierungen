@@ -47,7 +47,7 @@ ax.add_patch(plt.Rectangle((x_min, y_min),
                            edgecolor="none", zorder=1))
 
 # Orangene Linie vom Ursprung zum Zentrum
-ax.plot([0, center[0]], [0, center[1]], color="orange", linewidth=2, label="Positional Vector", zorder=2)
+ax.plot([0, center[0]], [0, center[1]], color="orange", linewidth=2, label="Positionsvektor", zorder=2)
 
 # Polygonfläche
 ax.fill(polygon_points[:, 0], polygon_points[:, 1],
@@ -67,6 +67,7 @@ ax.plot(np.append(polygon_points[:, 0], polygon_points[0, 0]),
 # Achsen und Beschriftungen
 ax.set_xlim(frame_xmin, frame_xmax)
 ax.set_ylim(frame_ymin, frame_ymax)
+ax.set_xticks([-350, -250, -150, -50, 0, 50, 150, 250, 350])
 ax.set_xlabel("Länge (mm)")
 ax.set_ylabel("Breite (mm)")
 ax.set_title("Designvektoren (45°)")

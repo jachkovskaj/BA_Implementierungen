@@ -218,10 +218,10 @@ def plot_graphs(history, trial_number, y_train, train_predict, y_val, val_predic
     plt.scatter(y_val, val_predict, label="Validationsdaten")
     ax = plt.gca()
     ax.legend(loc='upper left')
-    plt.xlabel('Reale Fließfronten [mm]', fontsize=15) # Adjust Label
+    plt.xlabel('Reale Fließfronten [s]', fontsize=15) # Adjust Label
     ax.set_xlim([0, 105]) # Adjust limit for the x-Axis
     ax.set_xticks(np.arange(0, 105, step=10)) # Adjust limit for the steps on the x-Axis
-    plt.ylabel('Vorhergesagte Fließfronten [mm]', fontsize=15) # Adjust label
+    plt.ylabel('Vorhergesagte Fließfronten [s]', fontsize=15) # Adjust label
     ax.set_ylim([0, 105])  # Adjust limit for the y-Axis
     ax.set_yticks(np.arange(0, 105, step=10)) # Adjust limit for the steps on the y-Axis
     line = mlines.Line2D([0, 1], [0, 1], color="black", alpha=0.8)
@@ -517,9 +517,9 @@ def data():
     pool_df = pd.read_excel(pool_filename)
 
     holdout_datain = holdout_df.iloc[:, :10]  # Spalten Input
-    holdout_dataout = holdout_df.iloc[:, -4]  # Spalten Output
+    holdout_dataout = holdout_df.iloc[:, -3]  # Spalten Output
     pool_datain = pool_df.iloc[:, :10]  # Spalten Input
-    pool_dataout = pool_df.iloc[:, -4]  # Spalten Output
+    pool_dataout = pool_df.iloc[:, -3]  # Spalten Output
 
     # Normalisieren
     hpoptimize.data_min_x = pool_datain.min().values.astype(float)
@@ -969,8 +969,8 @@ if __name__ == '__main__':
     # Set the path to the mplstyle file and adjust it for different dataset
     holdout_data = r"Getrennte_Daten/Holdout_fixed_Modell_1.xlsx"
     pool_data = r"Getrennte_Daten/Pool_Halton_Modell_1.xlsx"
-    study_name = "Study_15_10_2025_Halton_Modell_1.1_DUPLEX_Holdout_seed_999"
+    study_name = "Study_15_10_2025_Halton_Modell_1.2_DUPLEX_Holdout_seed_0"
 
     # Adjust the parameters and the Study name
-    run_hpo(study_name=study_name, seed=999, patience=100, n_trials=500, epochs=1000,
+    run_hpo(study_name=study_name, seed=0, patience=100, n_trials=500, epochs=1000,
             train_data=pool_data, test_data=holdout_data)

@@ -9,7 +9,6 @@ import atexit
 import glob
 import math
 import os
-import gc
 import signal
 import keras
 import matplotlib.lines as mlines
@@ -24,6 +23,7 @@ from tensorflow.keras import backend as K
 from optuna_integration import TFKerasPruningCallback
 from packaging import version
 from sklearn.metrics import root_mean_squared_error, r2_score
+
 
 optuna.logging.set_verbosity(optuna.logging.INFO)
 optuna.logging.enable_default_handler()
@@ -927,8 +927,8 @@ if __name__ == '__main__':
     # Set the path to the mplstyle file and adjust it for different dataset
     holdout_data = r"Getrennte_Daten/Holdout_fixed_Modell_1.xlsx"
     pool_data = r"Getrennte_Daten/Pool_Halton_Modell_1.xlsx"
-    study_name = "Study_15_10_2025_Halton_Modell_1.1_KS_Holdout_seed_999"
+    study_name = "Study_15_10_2025_Halton_Modell_1.2_KS_Holdout_seed_0"
 
     # Adjust the parameters and the Study name
-    run_hpo(study_name=study_name, seed=999, patience=100, n_trials=500, epochs=1000,
+    run_hpo(study_name=study_name, seed=0, patience=100, n_trials=500, epochs=1000,
             train_data=pool_data, test_data=holdout_data)

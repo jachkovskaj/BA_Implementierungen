@@ -22,8 +22,8 @@ from tensorflow.keras import backend as K
 from optuna_integration import TFKerasPruningCallback
 from packaging import version
 from sklearn.metrics import root_mean_squared_error, r2_score
-from sklearn.preprocessing import RobustScaler
-from numpy.linalg import norm
+from sklearn.neighbors import NearestNeighbors
+
 
 optuna.logging.set_verbosity(optuna.logging.INFO)
 optuna.logging.enable_default_handler()
@@ -192,7 +192,7 @@ def plot_graphs(history, trial_number, y_train, train_predict, y_val, val_predic
     plt.plot(history.history["root_mean_squared_error"], label="Trainingsdaten")
     ax.set_ylim(bottom=0)
     ax.set_xlim(left=0)
-    ax.set_ylabel("RMSE [mm/s]")
+    ax.set_ylabel("RMSE [-]")
     ax.set_xlabel("Epoche  [-]")
     ax.legend(loc="upper right")
     plt.tight_layout()
@@ -218,10 +218,10 @@ def plot_graphs(history, trial_number, y_train, train_predict, y_val, val_predic
     plt.scatter(y_val, val_predict, label="Validationsdaten")
     ax = plt.gca()
     ax.legend(loc='upper left')
-    plt.xlabel('Reale Fließfronten [mm]', fontsize=15) # Adjust Label
+    plt.xlabel('Reale Fließfronten [-]', fontsize=15) # Adjust Label
     ax.set_xlim([0, 105]) # Adjust limit for the x-Axis
     ax.set_xticks(np.arange(0, 105, step=10)) # Adjust limit for the steps on the x-Axis
-    plt.ylabel('Vorhergesagte Fließfronten [mm]', fontsize=15) # Adjust label
+    plt.ylabel('Vorhergesagte Fließfronten [-]', fontsize=15) # Adjust label
     ax.set_ylim([0, 105])  # Adjust limit for the y-Axis
     ax.set_yticks(np.arange(0, 105, step=10)) # Adjust limit for the steps on the y-Axis
     line = mlines.Line2D([0, 1], [0, 1], color="black", alpha=0.8)
@@ -448,41 +448,128 @@ def save_trial_results_with_dynamic_style(trial_number, y_train, train_predict, 
         # Chart einfügen
         worksheet_all_data.insert_chart("J2", chart_all_data)
 
-def duplex_split_indices(X, val_fraction=0.111111):
+
+def spxy_train_val_split(X, y, test_size=0.111111, metric="euclidean", alpha=0.5):
     """
-    Wählt per DUPLEX-/MaxMin-Strategie Indizes für das Validierungsset aus.
-    Der Rest der Daten kann dann als Trainingsset verwendet werden.
-
-    :param X: Eingabedaten (DataFrame oder ndarray)
-    :param val_fraction: Anteil der Daten, die als Validation verwendet werden sollen
-    :return: ndarray mit Indizes des Validierungssets
+    SPXY Split nach Galvão et al. (2005): joint X–Y distances.  [oai_citation:1‡ScienceDirect](https://www.sciencedirect.com/science/article/abs/pii/S003991400500192X?utm_source=chatgpt.com)
+    - X: (n_samples, n_features) DataFrame/ndarray
+    - y: (n_samples,) oder (n_samples, n_targets)
+    - test_size: Anteil für Validation (wie bei dir ~0.111111)
+    - metric: "euclidean" (Standard in vielen Umsetzungen)
+    - alpha: Gewichtung zwischen X- und y-Distanz (0..1). alpha=0.5 => gleichgewichtet
+    Rückgabe: X_train, X_val, y_train, y_val (Indices deterministisch)
     """
-    X = np.asarray(X)
-    n_samples = X.shape[0]
-    n_val = int(round(n_samples * val_fraction))
-    if n_val < 1:
-        raise ValueError("val_fraction zu klein, weniger als 1 Punkt.")
 
-    # Robust skalieren
-    Xs = RobustScaler().fit_transform(X)
+    # --- in numpy ---
+    Xn = np.asarray(X, dtype=float)
+    yn = np.asarray(y, dtype=float)
+    if yn.ndim == 1:
+        yn = yn.reshape(-1, 1)
 
-    # 1. Startpunkt: größter Norm-Abstand vom Ursprung
-    start = np.argmax(norm(Xs, axis=1))
-    val_idx = [int(start)]
-    taken = np.zeros(n_samples, dtype=bool)
-    taken[start] = True
+    n = Xn.shape[0]
+    n_val = int(np.ceil(n * test_size))
+    n_train = n - n_val
+    if n_train <= 1 or n_val <= 0:
+        raise ValueError("test_size führt zu ungültiger Train/Val-Aufteilung.")
 
-    # 2. Iteratives MaxMin-Picking
-    while len(val_idx) < n_val:
-        H = Xs[val_idx]  # bereits gewählte Punkte
-        dmin = np.min(norm(Xs[:, None, :] - H[None, :, :], axis=2), axis=1)
-        dmin[taken] = -np.inf  # bereits genommene Punkte blockieren
+    # --- pairwise distances (ohne scipy, robust) ---
+    # Distanzmatrix für X
+    # D_X[i,j] = ||X_i - X_j||
+    diffX = Xn[:, None, :] - Xn[None, :, :]
+    DX = np.sqrt(np.sum(diffX * diffX, axis=2))
 
-        next_idx = int(np.argmax(dmin))
-        val_idx.append(next_idx)
-        taken[next_idx] = True
+    # Distanzmatrix für y
+    diffY = yn[:, None, :] - yn[None, :, :]
+    DY = np.sqrt(np.sum(diffY * diffY, axis=2))
 
-    return np.array(val_idx, dtype=int)
+    # --- Normierung wie üblich, damit X und y vergleichbar sind ---
+    DX = DX / (DX.max() + 1e-12)
+    DY = DY / (DY.max() + 1e-12)
+
+    # --- Joint distance ---
+    # Viele Beschreibungen verwenden DX + DY (gleichgewichtet).
+    # Hier: gewichtete Summe, falls du testen willst:
+    D = alpha * DX + (1.0 - alpha) * DY
+
+    # --- KS-artige Selektion: max-min distance Auswahl für TRAIN ---
+    # Start: zwei am weitesten entfernte Punkte
+    i0, j0 = np.unravel_index(np.argmax(D), D.shape)
+    selected = [i0, j0]
+    remaining = set(range(n)) - set(selected)
+
+    # iterativ: wähle Punkt mit maximaler minimaler Distanz zu selected
+    while len(selected) < n_train:
+        rem_list = np.array(list(remaining), dtype=int)
+        # min distance to any selected for each remaining
+        min_d = np.min(D[rem_list][:, selected], axis=1)
+        k = rem_list[np.argmax(min_d)]
+        selected.append(int(k))
+        remaining.remove(int(k))
+
+    train_idx = np.array(selected, dtype=int)
+    val_idx = np.array(sorted(list(remaining)), dtype=int)
+
+    # --- zurück in Originaltypen (DataFrame bleibt DataFrame) ---
+    X_train = X.iloc[train_idx] if hasattr(X, "iloc") else Xn[train_idx]
+    X_val   = X.iloc[val_idx]   if hasattr(X, "iloc") else Xn[val_idx]
+    y_train = y.iloc[train_idx] if hasattr(y, "iloc") else y.reshape(-1, 1)[train_idx].reshape(-1)
+    y_val   = y.iloc[val_idx]   if hasattr(y, "iloc") else y.reshape(-1, 1)[val_idx].reshape(-1)
+
+    return X_train, X_val, y_train, y_val
+
+def local_regression_mix(
+    X: pd.DataFrame,
+    y: pd.Series,
+    n_augmented: int,
+    k_neighbors: int = 5,
+    seed: int = 0
+    ) -> tuple[pd.DataFrame, pd.Series]:
+    """
+    Lokale mischbasierte Datenerweiterung für Regression (vereinfacht).
+    - NUR Trainingsdaten!
+    - Auswahl lokaler Nachbarn im X-Raum
+    - lineare Interpolation von (X, y)
+    """
+    if n_augmented is None or int(n_augmented) <= 0:
+        return X, y
+
+    n_augmented = int(n_augmented)
+    k_neighbors = int(k_neighbors)
+
+    rng = np.random.default_rng(seed)
+
+    X_np = X.to_numpy(dtype=float)
+    y_np = y.to_numpy(dtype=float).reshape(-1, 1)
+    n_samples = X_np.shape[0]
+
+    # Wenn zu wenig Punkte: keine Augmentation
+    if n_samples < 2:
+        return X, y
+
+    # k begrenzen, damit es immer funktioniert
+    k_neighbors = max(1, min(k_neighbors, n_samples - 1))
+
+    nn = NearestNeighbors(n_neighbors=k_neighbors + 1)
+    nn.fit(X_np)
+    neighbors = nn.kneighbors(X_np, return_distance=False)
+
+    X_new = np.empty((n_augmented, X_np.shape[1]), dtype=float)
+    y_new = np.empty((n_augmented,), dtype=float)
+
+    for t in range(n_augmented):
+        i = rng.integers(0, n_samples)
+        neigh_idx = neighbors[i][1:]          # ohne sich selbst
+        j = rng.choice(neigh_idx)
+
+        lam = rng.uniform(0.0, 1.0)
+
+        X_new[t] = lam * X_np[i] + (1.0 - lam) * X_np[j]
+        y_new[t] = float(lam * y_np[i] + (1.0 - lam) * y_np[j])
+
+    X_aug = pd.concat([X, pd.DataFrame(X_new, columns=X.columns)], ignore_index=True)
+    y_aug = pd.concat([y, pd.Series(y_new, name=y.name)], ignore_index=True)
+
+    return X_aug, y_aug
 
 # Train-Test Erstellung mit Kennard Stone
 def data():
@@ -532,18 +619,35 @@ def data():
     holdout_df_in = (holdout_datain - hpoptimize.data_min_x) / (hpoptimize.data_max_x - hpoptimize.data_min_x)
     holdout_df_out = (holdout_dataout - hpoptimize.data_min_y) / (hpoptimize.data_max_y - hpoptimize.data_min_y)
 
-    # DUPLEX-Aufteilung: Validation-Indices auswählen
-    val_idx = (duplex_split_indices
-               (pool_df_in,
-                val_fraction=0.111111))
+    # SPXY Aufteilung (joint X–Y distances)
+    x_train, x_val, y_train, y_val = spxy_train_val_split(
+        pool_df_in,
+        pool_df_out,
+        test_size=0.111111,
+        alpha=0.5
+    )
+    # ============================================================
+    # RegMix / lokale mischbasierte Datenerweiterung (NUR Training)
+    # ============================================================
+    aug = getattr(hpoptimize, "n_augmented", 0)
 
-    mask = np.ones(len(pool_df_in), dtype=bool)
-    mask[val_idx] = False
+    # aug kann sein:
+    # - 0          -> aus
+    # - 0.5        -> +50% von len(x_train)
+    # - 500        -> +500 Punkte fix
+    if isinstance(aug, float) and 0.0 < aug < 1.0:
+        n_aug = int(round(aug * len(x_train)))
+    else:
+        n_aug = int(aug)
 
-    x_val = pool_df_in.iloc[val_idx].reset_index(drop=True)
-    y_val = pool_df_out.iloc[val_idx].reset_index(drop=True)
-    x_train = pool_df_in.iloc[mask].reset_index(drop=True)
-    y_train = pool_df_out.iloc[mask].reset_index(drop=True)
+    if n_aug > 0:
+        x_train, y_train = local_regression_mix(
+            X=x_train,
+            y=y_train,
+            n_augmented=n_aug,
+            k_neighbors=int(getattr(hpoptimize, "k_neighbors", 5)),
+            seed=int(hpoptimize.seed)
+        )
 
     x_test, y_test = holdout_df_in, holdout_df_out
 
@@ -567,7 +671,7 @@ def save_split_data(x_train, y_train, x_val, y_val, x_test, y_test):
     :param x_test: Test-Eingabedaten
     :param y_test: Test-Zieldaten
     """
-    output_folder = f"Ergebnisse_Teil_2/{hpoptimize.study_name}"
+    output_folder = f"Ergebnisse_Teil_3/{hpoptimize.study_name}"
     os.makedirs(output_folder, exist_ok=True)
     file_path = os.path.join(hpoptimize.paths["data"], f"Split_Daten_{hpoptimize.study_name}.xlsx")
 
@@ -807,7 +911,7 @@ def save_study_results():
     if current_study:
         print("\nSaving study results...")
         study_name = hpoptimize.study_name
-        study_path = f"Ergebnisse_Teil_2/{study_name}"
+        study_path = f"Ergebnisse_Teil_3/{study_name}"
         os.makedirs(study_path, exist_ok=True)  # Ensure the directory exists
         study_file = f"{study_path}/{study_name}.xlsx"
         current_study.trials_dataframe().to_excel(study_file)
@@ -889,7 +993,7 @@ def cleanup_top10(study, trial, base_name):
     print(f"Cleanup done → Top 10 Trials: {[t.number for t in top10]}")
 
 # Main
-def run_hpo(study_name, seed, patience, epochs, n_trials, train_data, test_data):
+def run_hpo(study_name, seed, patience, epochs, n_trials, train_data, test_data, n_augmented=0, k_neighbors=5):
     """
     Execute a hyperparameter optimization (HPO) workflow using Optuna. The function initializes
     an Optuna study with specified parameters, performs optimization over a defined number
@@ -912,9 +1016,10 @@ def run_hpo(study_name, seed, patience, epochs, n_trials, train_data, test_data)
     """
     global current_study
     initialize(study_name, seed, patience, epochs, n_trials, train_data, test_data)
-
+    hpoptimize.n_augmented = n_augmented  # kann float (ratio) oder int (absolute) sein
+    hpoptimize.k_neighbors = int(k_neighbors)
     # Ergebnisse_Teil_2-Unterordner für bessere Struktur
-    base_dir = f"Ergebnisse_Teil_2/{hpoptimize.study_name}"
+    base_dir = f"Ergebnisse_Teil_3/{hpoptimize.study_name}"
     hpoptimize.paths = {
         "base": base_dir,
         "models": os.path.join(base_dir, "models"),
@@ -964,13 +1069,62 @@ def run_hpo(study_name, seed, patience, epochs, n_trials, train_data, test_data)
 
     save_study_results()
 
+def load_best_value_from_study(study_name: str) -> float:
+    base_dir = f"Ergebnisse_Teil_3/{study_name}"
+    os.makedirs(base_dir, exist_ok=True)  # stellt sicher, dass der Pfad existiert
+    storage = f"sqlite:///{os.path.join(base_dir, study_name + '.sqlite3')}"
+    st = optuna.load_study(study_name=study_name, storage=storage)
+    return float(st.best_value)
+
+def get_target_rmse_from_study_xlsx(study_name: str,
+                                    base_dir: str = "Ergebnisse_Teil_2",
+                                    value_col: str = "value",
+                                    state_col: str = "state") -> float:
+    """
+    Liest Ergebnisse_Teil_2/<study_name>/<study_name>.xlsx (Optuna trials_dataframe)
+    und gibt den besten (kleinsten) value unter COMPLETE zurück.
+    """
+    xlsx_path = os.path.join(base_dir, study_name, f"{study_name}.xlsx")
+    if not os.path.isfile(xlsx_path):
+        raise FileNotFoundError(f"Study-Excel nicht gefunden: {xlsx_path}")
+
+    df = pd.read_excel(xlsx_path)
+
+    if value_col not in df.columns:
+        raise KeyError(f"Spalte '{value_col}' nicht gefunden in {xlsx_path}. Vorhanden: {list(df.columns)}")
+    if state_col not in df.columns:
+        # Fallback: manche Exporte nennen es 'state' oder haben es anders; ohne state können wir nicht filtern
+        raise KeyError(f"Spalte '{state_col}' nicht gefunden in {xlsx_path}. Vorhanden: {list(df.columns)}")
+
+    df_complete = df[df[state_col].astype(str).str.upper().eq("COMPLETE")].copy()
+    df_complete = df_complete[pd.to_numeric(df_complete[value_col], errors="coerce").notna()]
+
+    if df_complete.empty:
+        raise ValueError(f"Keine COMPLETE-Trials mit gültigem '{value_col}' in {xlsx_path} gefunden.")
+
+    # RMSE wird minimiert -> bester Wert ist MIN
+    return float(df_complete[value_col].min())
 
 if __name__ == '__main__':
-    # Set the path to the mplstyle file and adjust it for different dataset
     holdout_data = r"Getrennte_Daten/Holdout_fixed_Modell_1.xlsx"
-    pool_data = r"Getrennte_Daten/Pool_Halton_Modell_1.xlsx"
-    study_name = "Study_15_10_2025_Halton_Modell_1.3_DUPLEX_Holdout_seed_42"
+    pool_data    = r"Getrennte_Daten/Pool_Halton_Modell_1.xlsx"
 
-    # Adjust the parameters and the Study name
-    run_hpo(study_name=study_name, seed=42, patience=100, n_trials=500, epochs=1000,
-            train_data=pool_data, test_data=holdout_data)
+    study_name = "Study_15_10_2025_Halton_Modell_1.3_Halton_SPXY_RegMix_Holdout_seed_999"
+
+    # Beispiel: +100% zusätzliche Trainingspunkte (nach Split!)
+    # Wenn du lieber fix willst: z.B. n_augmented=500
+    n_augmented = 0.5      # <-- hier einstellen (0.5 = 50%)
+    k_neighbors = 5
+
+    run_hpo(
+        study_name=study_name,
+        seed=999,
+        patience=100,
+        epochs=1000,
+        n_trials=500,
+        train_data=pool_data,
+        test_data=holdout_data,
+        n_augmented=n_augmented,
+        k_neighbors=k_neighbors
+    )
+
